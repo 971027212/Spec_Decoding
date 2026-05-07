@@ -24,20 +24,20 @@ The core process rely on the specific behavior of the Transformer model that all
 ## How to use
 
 ### 0. Installation
-This project requires Python 3.7 or later and the following dependencies:
+This fork is intended to run inside a Conda virtual environment. Create and activate the environment with:
 
-```
-rich
-tqdm
-termcolor
-tokenizers>=0.19.1
-torch>=2.3.0
-transformers>=4.41.1
-accelerate>=0.30.1
-bitsandbytes>=0.43.1
+```bash
+conda env create -f environment.yml
+conda activate specd
 ```
 
-Simply fork this repository and install the dependencies.
+If you need to rebuild the environment after `environment.yml` changes, run:
+
+```bash
+conda env update -f environment.yml --prune
+```
+
+The same Python packages are also listed in `requirements.txt` for pip-only fallback installs.
 
 ### 1. Generate text using Speculative Decoding
 
@@ -157,10 +157,11 @@ Be careful to change the generate methods to encoder-decoder models if you are u
 
 This fork adds a non-interactive timing path for single-server reproduction. The target model is served through a local HTTP process so each target call can be split into approximate upload, cloud verification, downlink, and client decode phases. Because the service usually runs on `127.0.0.1`, these upload/downlink numbers are localhost transport timings rather than public-network latency.
 
-Install dependencies:
+Create and activate the Conda environment:
 
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate specd
 ```
 
 Start the target service in one terminal:
