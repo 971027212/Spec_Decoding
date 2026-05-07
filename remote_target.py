@@ -1,12 +1,56 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import http.client
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
 from profiling import now_ns
+
+
+@dataclass(frozen=True)
+class NetworkSimulation:
+    enabled: bool = False
+    rtt_ms: float = 0.0
+    uplink_mbps: float = 0.0
+    downlink_mbps: float = 0.0
+
+    @property
+    def one_way_latency_ns(self) -> int:
+        if not self.enabled or self.rtt_ms <= 0:
+            return 0
+        return int((self.rtt_ms / 2.0) * 1_000_000)
+
+    def uplink_delay_ns(self, request_bytes: int) -> int:
+        return self._transfer_delay_ns(request_bytes, self.uplink_mbps)
+
+    def downlink_delay_ns(self, response_bytes: int) -> int:
+        return self._transfer_delay_ns(response_bytes, self.downlink_mbps)
+
+    def _transfer_delay_ns(self, num_bytes: int, mbps: float) -> int:
+        if not self.enabled:
+            return 0
+        latency_ns = self.one_way_latency_ns
+        if mbps <= 0:
+            return latency_ns
+        bandwidth_ns = int((num_bytes * 8 * 1_000_000_000) / (mbps * 1_000_000))
+        return latency_ns + bandwidth_ns
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "network_simulated": self.enabled,
+            "sim_rtt_ms": self.rtt_ms,
+            "sim_uplink_mbps": self.uplink_mbps,
+            "sim_downlink_mbps": self.downlink_mbps,
+        }
+
+
+def _sleep_ns(duration_ns: int) -> None:
+    if duration_ns > 0:
+        time.sleep(duration_ns / 1_000_000_000)
 
 
 class RemoteTargetModel:
@@ -20,11 +64,13 @@ class RemoteTargetModel:
         base_url: str,
         output_device: str = "cpu",
         timeout: float = 120.0,
+        network_simulation: NetworkSimulation | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.output_device = output_device
         self.device = output_device
         self.timeout = timeout
+        self.network_simulation = network_simulation or NetworkSimulation()
         self.metadata = self._get_json("/metadata")
         self.config = SimpleNamespace(**self.metadata.get("config", {}))
 
@@ -81,9 +127,12 @@ class RemoteTargetModel:
         headers: dict[str, str] = {}
         status = 0
         raw_body = b""
+        simulated_upload_ns = self.network_simulation.uplink_delay_ns(len(body))
+        simulated_downlink_ns = 0
         total_start = now_ns()
         try:
             upload_start = now_ns()
+            _sleep_ns(simulated_upload_ns)
             connection.putrequest("POST", f"{base_path}/forward")
             connection.putheader("Content-Type", "application/json")
             connection.putheader("Accept", "application/json")
@@ -99,6 +148,8 @@ class RemoteTargetModel:
 
             downlink_start = now_ns()
             raw_body = response.read()
+            simulated_downlink_ns = self.network_simulation.downlink_delay_ns(len(raw_body))
+            _sleep_ns(simulated_downlink_ns)
             downlink_ns = now_ns() - downlink_start
         finally:
             connection.close()
@@ -121,7 +172,12 @@ class RemoteTargetModel:
                 "logits_start": logits_start,
                 "logits_end": logits_end,
                 "logits_shape": decoded.get("shape"),
+                "simulated_upload_ns": simulated_upload_ns,
+                "simulated_upload_ms": simulated_upload_ns / 1_000_000,
+                "simulated_downlink_ns": simulated_downlink_ns,
+                "simulated_downlink_ms": simulated_downlink_ns / 1_000_000,
             }
+            common.update(self.network_simulation.metadata())
             if profile_metadata:
                 common.update(profile_metadata)
             profiler.record("target_request_encode", encode_ns, **common)

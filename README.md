@@ -196,6 +196,22 @@ If only the target model is available locally, run the target autoregressive bas
 python benchmark.py --target-url http://127.0.0.1:8000 --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B --modes target_ar --local-files-only --output-dir results_target_ar
 ```
 
+To simulate a cloud target while still running the service on the same server, add code-level network delay and bandwidth limits in the benchmark client. The example below simulates 40 ms RTT, 100 Mbps uplink, and 200 Mbps downlink:
+
+```bash
+python benchmark.py \
+  --target-url http://127.0.0.1:8000 \
+  --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
+  --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
+  --modes speculative,target_ar \
+  --local-files-only \
+  --simulate-network \
+  --sim-rtt-ms 40 \
+  --sim-uplink-mbps 100 \
+  --sim-downlink-mbps 200 \
+  --output-dir results_cloud_sim
+```
+
 The benchmark writes:
 
 - `raw_events.jsonl`: per-event timing trace.

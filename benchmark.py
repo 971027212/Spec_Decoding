@@ -213,7 +213,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from remote_target import RemoteTargetModel
+    from remote_target import NetworkSimulation, RemoteTargetModel
     from sampling import autoregressive_generate, speculative_generate
     from utils.logits_processor import GreedyProcessor
 
@@ -221,7 +221,18 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     prompts = load_prompts(args.prompts_file)
     device = _resolve_device(torch, args.device)
     dtype = _resolve_torch_dtype(torch, args.dtype)
-    target = RemoteTargetModel(args.target_url, output_device=args.target_output_device, timeout=args.timeout)
+    network_simulation = NetworkSimulation(
+        enabled=args.simulate_network,
+        rtt_ms=args.sim_rtt_ms,
+        uplink_mbps=args.sim_uplink_mbps,
+        downlink_mbps=args.sim_downlink_mbps,
+    )
+    target = RemoteTargetModel(
+        args.target_url,
+        output_device=args.target_output_device,
+        timeout=args.timeout,
+        network_simulation=network_simulation,
+    )
     tokenizer_model = args.tokenizer or target.metadata.get("model") or DEFAULT_TARGET_MODEL
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -268,6 +279,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         "prompt_tokens": len(input_ids),
                         "target_url": args.target_url,
                         "drafter_model": args.drafter_model,
+                        **network_simulation.metadata(),
                     },
                 )
 
@@ -337,6 +349,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-text", action="store_true")
     parser.add_argument("--chat-template", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-files-only", action="store_true", help="Load tokenizer/drafter files locally only.")
+    parser.add_argument("--simulate-network", action="store_true", help="Add code-level remote network delay simulation.")
+    parser.add_argument("--sim-rtt-ms", type=float, default=0.0, help="Simulated round-trip propagation latency.")
+    parser.add_argument("--sim-uplink-mbps", type=float, default=0.0, help="Simulated client-to-cloud bandwidth.")
+    parser.add_argument("--sim-downlink-mbps", type=float, default=0.0, help="Simulated cloud-to-client bandwidth.")
     parser.add_argument("--fake", action="store_true", help="Generate synthetic timing files without loading models.")
     return parser.parse_args(argv)
 
