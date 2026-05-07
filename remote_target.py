@@ -222,6 +222,103 @@ class RemoteTargetModel:
 
         return SimpleNamespace(logits=logits, past_key_values=None)
 
+    def generate(
+        self,
+        input_ids,
+        max_gen_len: int,
+        eos_tokens_id: int | list[int],
+        pad_token_id: int = 0,
+        use_cache: bool = False,
+        profiler=None,
+        profile_metadata: dict[str, Any] | None = None,
+    ) -> list[int]:
+        ids = input_ids.detach().to("cpu").tolist() if hasattr(input_ids, "detach") else input_ids
+        payload = {
+            "input_ids": ids,
+            "max_gen_len": max_gen_len,
+            "eos_tokens_id": eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id],
+            "pad_token_id": pad_token_id,
+            "use_cache": use_cache,
+        }
+
+        encode_start = now_ns()
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        encode_ns = now_ns() - encode_start
+
+        connection, base_path = self._connection()
+        headers: dict[str, str] = {}
+        status = 0
+        raw_body = b""
+        simulated_upload_ns = self.network_simulation.uplink_delay_ns(len(body))
+        simulated_downlink_ns = 0
+        total_start = now_ns()
+        try:
+            upload_start = now_ns()
+            _sleep_ns(simulated_upload_ns)
+            connection.putrequest("POST", f"{base_path}/generate")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Accept", "application/json")
+            connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
+            upload_ns = now_ns() - upload_start
+
+            wait_start = now_ns()
+            response = connection.getresponse()
+            response_wait_ns = now_ns() - wait_start
+            status = response.status
+            headers = {key.lower(): value for key, value in response.getheaders()}
+
+            downlink_start = now_ns()
+            raw_body = response.read()
+            simulated_downlink_ns = self.network_simulation.downlink_delay_ns(len(raw_body))
+            _sleep_ns(simulated_downlink_ns)
+            downlink_ns = now_ns() - downlink_start
+        finally:
+            connection.close()
+        total_http_ns = now_ns() - total_start
+
+        decode_start = now_ns()
+        decoded = json.loads(raw_body.decode("utf-8"))
+        decode_ns = now_ns() - decode_start
+
+        if status >= 400:
+            raise RuntimeError(decoded.get("error", raw_body.decode("utf-8", errors="replace")))
+
+        output_ids = [int(token_id) for token_id in decoded["output_ids"]]
+        if profiler is not None:
+            common = {
+                "status": status,
+                "request_bytes": len(body),
+                "response_bytes": len(raw_body),
+                "response_format": "json",
+                "generated_tokens": len(output_ids),
+                "stop_reason": decoded.get("stop_reason"),
+                "remote_generate_use_cache": use_cache,
+                "simulated_upload_ns": simulated_upload_ns,
+                "simulated_upload_ms": simulated_upload_ns / 1_000_000,
+                "simulated_downlink_ns": simulated_downlink_ns,
+                "simulated_downlink_ms": simulated_downlink_ns / 1_000_000,
+            }
+            common.update(self.network_simulation.metadata())
+            if profile_metadata:
+                common.update(profile_metadata)
+            profiler.record("target_request_encode", encode_ns, **common)
+            profiler.record("target_upload", upload_ns, **common)
+            profiler.record("target_response_wait", response_wait_ns, **common)
+            profiler.record("target_downlink", downlink_ns, **common)
+            profiler.record("target_response_decode", decode_ns, **common)
+            profiler.record("target_http_total", total_http_ns, **common)
+            _record_header_ns(profiler, headers, "x-target-cloud-generate-ns", "target_cloud_generate", common)
+            _record_header_ns(profiler, headers, "x-target-model-forward-ns", "target_model_forward", common)
+            _record_header_ns(profiler, headers, "x-target-response-encode-ns", "target_server_encode", common)
+            steps = headers.get("x-target-generate-steps")
+            if steps is not None:
+                try:
+                    profiler.set_metric("target_generate_steps", int(steps))
+                except ValueError:
+                    pass
+        return output_ids
+
 
 def _record_header_ns(profiler, headers: dict[str, str], header: str, phase: str, metadata: dict[str, Any]) -> None:
     value = headers.get(header)

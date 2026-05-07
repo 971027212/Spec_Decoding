@@ -153,9 +153,11 @@ python infer.py
 To change the models used, you can change the `target_model_name` and `drafter_model_name` in the `infer.py` file.
 Be careful to change the generate methods to encoder-decoder models if you are using encoder-decoder models.
 
-### 3. Benchmark timing distribution with a local target service
+### 3. Benchmark edge-cloud timing distribution
 
-This fork adds a non-interactive timing path for single-server reproduction. The target model is served through a local HTTP process so each target call can be split into approximate upload, cloud verification, downlink, and client decode phases. Because the service usually runs on `127.0.0.1`, these upload/downlink numbers are localhost transport timings rather than public-network latency.
+This fork adds a non-interactive timing path for single-server reproduction. The target model is served through a local HTTP process so target-side work can be split into upload, cloud compute, downlink, and client decode phases.
+
+The main cloud baseline is `cloud_target_generate`: the client uploads the prompt once, the target HTTP service generates the complete answer on the cloud side, and the client downloads the final output ids once. The legacy `target_ar` mode is kept only as a diagnostic mode because it sends one HTTP request per generated token, which is not representative of normal cloud inference service behavior.
 
 Create and activate the Conda environment:
 
@@ -178,25 +180,19 @@ export TRANSFORMERS_OFFLINE=1
 python serve_target.py --model /home/chajiahao/data/hf_models/Qwen2.5-1.5B --device cuda --local-files-only
 ```
 
-Run the benchmark in a second terminal:
-
-```bash
-python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model Qwen/Qwen2.5-0.5B-Instruct --modes speculative,target_ar --output-dir results
-```
-
-For lower localhost overhead, use binary logits instead of JSON logits:
+Run the normal cloud target-only baseline and the edge-cloud speculative path in a second terminal:
 
 ```bash
 python benchmark.py \
   --target-url http://127.0.0.1:8000 \
   --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
   --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
-  --modes speculative,target_ar \
+  --modes cloud_target_generate,speculative \
   --local-files-only \
   --target-output-device cuda \
   --response-format binary \
   --response-dtype float32 \
-  --output-dir experiments/binary_logits/localhost
+  --output-dir experiments/edge_cloud/main_local
 ```
 
 To measure the pure local target-only baseline without HTTP upload/downlink, stop the target service first if GPU memory is tight, then run:
@@ -208,19 +204,7 @@ python benchmark.py \
   --modes local_target_ar \
   --local-files-only \
   --device cuda \
-  --output-dir experiments/binary_logits/local_target_ar
-```
-
-For offline speculative decoding, the drafter must also exist locally and share the same tokenizer/vocabulary as the target model:
-
-```bash
-python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B --modes speculative,target_ar --local-files-only --output-dir results
-```
-
-If only the target model is available locally, run the target autoregressive baseline first:
-
-```bash
-python benchmark.py --target-url http://127.0.0.1:8000 --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B --modes target_ar --local-files-only --output-dir results_target_ar
+  --output-dir experiments/edge_cloud/local_target
 ```
 
 To simulate a cloud target while still running the service on the same server, add code-level network delay and bandwidth limits in the benchmark client. The example below simulates 40 ms RTT, 100 Mbps uplink, and 200 Mbps downlink:
@@ -230,14 +214,24 @@ python benchmark.py \
   --target-url http://127.0.0.1:8000 \
   --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
   --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
-  --modes speculative,target_ar \
+  --modes cloud_target_generate,speculative \
   --local-files-only \
+  --target-output-device cuda \
+  --response-format binary \
+  --response-dtype float32 \
   --simulate-network \
   --sim-rtt-ms 40 \
   --sim-uplink-mbps 100 \
   --sim-downlink-mbps 200 \
-  --output-dir results_cloud_sim
+  --output-dir experiments/edge_cloud/cloud_sim
 ```
+
+The supported benchmark modes are:
+
+- `local_target_ar`: pure local target-only baseline with no HTTP and no network phases.
+- `cloud_target_generate`: normal cloud target-only baseline; upload prompt once, generate the full answer in `/generate`, download final output ids once.
+- `speculative`: edge-cloud speculative decoding; local drafter generates drafts and the target HTTP service verifies draft blocks through `/forward`.
+- `target_ar`: legacy diagnostic mode; one target HTTP request per generated token. This is useful for diagnosing RTT sensitivity but should not be used as the main cloud baseline.
 
 The benchmark writes:
 

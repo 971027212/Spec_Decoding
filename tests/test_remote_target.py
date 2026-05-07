@@ -32,6 +32,19 @@ class FakeTargetHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers["Content-Length"])
         payload = json.loads(self.rfile.read(length).decode())
+        if self.path == "/generate":
+            body = json.dumps({"output_ids": [2, 3], "generated_tokens": 2, "stop_reason": "max_tokens"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Target-Cloud-Generate-Ns", "456")
+            self.send_header("X-Target-Model-Forward-Ns", "400")
+            self.send_header("X-Target-Response-Encode-Ns", "56")
+            self.send_header("X-Target-Generate-Steps", "2")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if payload.get("response_format") == "binary":
             tensor = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]], dtype=torch.float32)
             body = tensor.numpy().tobytes(order="C")
@@ -105,6 +118,31 @@ class RemoteTargetTests(unittest.TestCase):
             self.assertAlmostEqual(float(output.logits[0, 0, 3]), 0.4, places=5)
             phases = {event["phase"] for event in recorder.events}
             self.assertIn("target_tensor_materialize", phases)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_remote_target_generate_records_cloud_generation(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTargetHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            target = RemoteTargetModel(url)
+            recorder = TimingRecorder(mode="cloud_target_generate")
+
+            output_ids = target.generate(
+                [1, 2],
+                max_gen_len=2,
+                eos_tokens_id=[0],
+                profiler=recorder,
+            )
+
+            self.assertEqual(output_ids, [2, 3])
+            phases = {event["phase"] for event in recorder.events}
+            self.assertIn("target_upload", phases)
+            self.assertIn("target_cloud_generate", phases)
+            self.assertEqual(recorder.metrics["target_generate_steps"], 2)
         finally:
             server.shutdown()
             server.server_close()

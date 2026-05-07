@@ -52,6 +52,13 @@ def make_handler(model, model_name: str, device):
         if getattr(device, "type", str(device)) == "cuda":
             torch.cuda.synchronize(device)
 
+    def normalize_stop_tokens(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, int):
+            return [value]
+        return [int(item) for item in value]
+
     class TargetHandler(BaseHTTPRequestHandler):
         server_version = "SpecDTarget/0.1"
 
@@ -76,16 +83,24 @@ def make_handler(model, model_name: str, device):
             _error(self, 404, f"Unknown path: {self.path}")
 
         def do_POST(self) -> None:
-            if self.path != "/forward":
-                _error(self, 404, f"Unknown path: {self.path}")
+            if self.path == "/forward":
+                self._handle_forward()
                 return
+            if self.path == "/generate":
+                self._handle_generate()
+                return
+            _error(self, 404, f"Unknown path: {self.path}")
 
+        def _read_payload(self) -> dict[str, Any]:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(content_length)
+            return json.loads(raw_body.decode("utf-8"))
+
+        def _handle_forward(self) -> None:
             try:
-                content_length = int(self.headers.get("Content-Length", "0"))
-                raw_body = self.rfile.read(content_length)
-                payload = json.loads(raw_body.decode("utf-8"))
+                payload = self._read_payload()
                 if payload.get("use_cache"):
-                    _error(self, 400, "Remote target service does not support use_cache=true.")
+                    _error(self, 400, "Remote target service does not support use_cache=true for /forward.")
                     return
 
                 input_ids = payload["input_ids"]
@@ -138,6 +153,84 @@ def make_handler(model, model_name: str, device):
                 self.send_header("X-Target-Response-Format", response_format)
                 self.send_header("X-Target-Logits-Dtype", response_dtype_name if response_format == "binary" else "float32")
                 self.send_header("X-Target-Logits-Shape", json.dumps(list(logits.shape), separators=(",", ":")))
+                self.end_headers()
+                self.wfile.write(response_body)
+            except Exception as exc:
+                _error(self, 500, str(exc))
+
+        def _handle_generate(self) -> None:
+            try:
+                payload = self._read_payload()
+                input_ids = payload["input_ids"]
+                max_gen_len = int(payload.get("max_gen_len", 35))
+                use_cache = bool(payload.get("use_cache", False))
+                eos_tokens = normalize_stop_tokens(payload.get("eos_tokens_id", payload.get("eos_token_ids")))
+                pad_token_id = int(payload.get("pad_token_id", 0))
+
+                prompt = torch.tensor(input_ids, dtype=torch.long, device=device)
+                if prompt.ndim == 2:
+                    prompt = prompt[0]
+                prompt_len = int(prompt.numel())
+                max_seq_length = (
+                    model.config.max_position_embeddings
+                    if hasattr(model.config, "max_position_embeddings")
+                    else (model.config.max_context_length if hasattr(model.config, "max_context_length") else 1024)
+                )
+                total_len = min(max_seq_length, prompt_len + max_gen_len)
+                sequence = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=device)
+                sequence[0, :prompt_len] = prompt
+                stop_tokens = torch.tensor(eos_tokens, dtype=torch.long, device=device) if eos_tokens else None
+
+                generated: list[int] = []
+                model_forward_ns = 0
+                cache = None
+                stop_reason = "max_tokens"
+
+                synchronize()
+                generate_start = now_ns()
+                with torch.no_grad():
+                    for curr in range(prompt_len, total_len):
+                        if use_cache and cache is not None:
+                            model_input = sequence[..., curr - 1 : curr]
+                        else:
+                            model_input = sequence[..., :curr]
+
+                        synchronize()
+                        forward_start = now_ns()
+                        outputs = model(input_ids=model_input, past_key_values=cache, use_cache=use_cache)
+                        synchronize()
+                        model_forward_ns += now_ns() - forward_start
+
+                        logits = outputs.logits[..., -1, :]
+                        next_token = torch.argmax(logits, dim=-1)
+                        sequence[0, curr] = next_token
+                        token_id = int(next_token.item())
+                        generated.append(token_id)
+                        cache = outputs.past_key_values if use_cache else None
+
+                        if stop_tokens is not None and torch.isin(next_token, stop_tokens).item():
+                            stop_reason = "eos"
+                            break
+                synchronize()
+                cloud_generate_ns = now_ns() - generate_start
+
+                encode_start = now_ns()
+                response_payload = {
+                    "output_ids": generated,
+                    "generated_tokens": len(generated),
+                    "stop_reason": stop_reason,
+                    "use_cache": use_cache,
+                }
+                response_body = json.dumps(response_payload, separators=(",", ":")).encode("utf-8")
+                response_encode_ns = now_ns() - encode_start
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.send_header("X-Target-Cloud-Generate-Ns", str(cloud_generate_ns))
+                self.send_header("X-Target-Model-Forward-Ns", str(model_forward_ns))
+                self.send_header("X-Target-Response-Encode-Ns", str(response_encode_ns))
+                self.send_header("X-Target-Generate-Steps", str(len(generated)))
                 self.end_headers()
                 self.wfile.write(response_body)
             except Exception as exc:
@@ -204,7 +297,7 @@ def main() -> None:
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(model, args.model, device))
     print(f"Target service ready at http://{args.host}:{args.port}")
-    print("Endpoints: /health, /metadata, /forward")
+    print("Endpoints: /health, /metadata, /forward, /generate")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

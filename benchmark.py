@@ -20,6 +20,7 @@ PHASES_FOR_PLOTS = [
     "target_request_encode_ms",
     "drafter_generate_ms",
     "target_forward_ms",
+    "target_cloud_generate_ms",
     "target_upload_ms",
     "target_cloud_verify_ms",
     "target_server_encode_ms",
@@ -32,7 +33,7 @@ PHASES_FOR_PLOTS = [
 
 def parse_modes(value: str) -> list[str]:
     modes = [item.strip() for item in value.split(",") if item.strip()]
-    allowed = {"speculative", "target_ar", "local_target_ar"}
+    allowed = {"speculative", "cloud_target_generate", "target_ar", "local_target_ar"}
     unknown = [mode for mode in modes if mode not in allowed]
     if unknown:
         raise argparse.ArgumentTypeError(f"Unsupported modes: {', '.join(unknown)}")
@@ -143,6 +144,13 @@ def run_fake(args: argparse.Namespace) -> dict[str, Path]:
             scale = run_index + 1
             if mode == "local_target_ar":
                 recorder.record("target_forward", 4_500_000 + 100_000 * scale)
+            elif mode == "cloud_target_generate":
+                recorder.record("target_request_encode", 120_000 + 5_000 * scale)
+                recorder.record("target_upload", 900_000 + 25_000 * scale)
+                recorder.record("target_cloud_generate", 5_000_000 + 100_000 * scale)
+                recorder.record("target_server_encode", 80_000 + 5_000 * scale)
+                recorder.record("target_downlink", 700_000 + 20_000 * scale)
+                recorder.record("target_response_decode", 100_000 + 5_000 * scale)
             else:
                 recorder.record("target_request_encode", 120_000 + 5_000 * scale)
                 recorder.record("target_upload", 900_000 + 25_000 * scale)
@@ -226,7 +234,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     prompts = load_prompts(args.prompts_file)
     device = _resolve_device(torch, args.device)
     dtype = _resolve_torch_dtype(torch, args.dtype)
-    remote_modes = {"speculative", "target_ar"}
+    remote_modes = {"speculative", "cloud_target_generate", "target_ar"}
     uses_remote_target = any(mode in remote_modes for mode in modes)
     network_simulation = NetworkSimulation(
         enabled=args.simulate_network,
@@ -305,6 +313,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         "drafter_model": args.drafter_model,
                         "response_format": args.response_format,
                         "response_dtype": args.response_dtype,
+                        "cloud_generate_use_cache": args.cloud_use_cache,
                         **network_simulation.metadata(),
                     },
                 )
@@ -344,6 +353,18 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         debug=False,
                         profiler=recorder,
                     )
+                elif mode == "cloud_target_generate":
+                    if target is None:
+                        raise RuntimeError("cloud_target_generate mode requires a remote target service.")
+                    output_ids = target.generate(
+                        input_ids,
+                        max_gen_len=args.max_tokens,
+                        eos_tokens_id=end_tokens,
+                        pad_token_id=pad_token_id,
+                        use_cache=args.cloud_use_cache,
+                        profiler=recorder,
+                        profile_metadata={"call_kind": "cloud_generate"},
+                    )
                 elif mode == "local_target_ar":
                     if local_target is None:
                         raise RuntimeError("local_target_ar mode requires a local target model.")
@@ -380,7 +401,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drafter-model", default=DEFAULT_DRAFTER_MODEL)
     parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--prompts-file", default=None)
-    parser.add_argument("--modes", default="speculative,target_ar")
+    parser.add_argument(
+        "--modes",
+        default="speculative,cloud_target_generate",
+        help=(
+            "Comma-separated modes. Main modes: speculative, cloud_target_generate, "
+            "local_target_ar. Diagnostic legacy mode: target_ar (one HTTP request per token)."
+        ),
+    )
     parser.add_argument("--gamma", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=35)
     parser.add_argument("--warmup-runs", type=int, default=1)
@@ -395,6 +423,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-text", action="store_true")
     parser.add_argument("--chat-template", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cloud-use-cache", action="store_true", help="Use KV-cache inside the /generate cloud target baseline.")
     parser.add_argument("--local-files-only", action="store_true", help="Load tokenizer/drafter files locally only.")
     parser.add_argument("--simulate-network", action="store_true", help="Add code-level remote network delay simulation.")
     parser.add_argument("--sim-rtt-ms", type=float, default=0.0, help="Simulated round-trip propagation latency.")
