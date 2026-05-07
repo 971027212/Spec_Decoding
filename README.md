@@ -196,7 +196,19 @@ python benchmark.py \
   --target-output-device cuda \
   --response-format binary \
   --response-dtype float32 \
-  --output-dir results_binary
+  --output-dir experiments/binary_logits/localhost
+```
+
+To measure the pure local target-only baseline without HTTP upload/downlink, stop the target service first if GPU memory is tight, then run:
+
+```bash
+python benchmark.py \
+  --local-target-model /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
+  --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
+  --modes local_target_ar \
+  --local-files-only \
+  --device cuda \
+  --output-dir experiments/binary_logits/local_target_ar
 ```
 
 For offline speculative decoding, the drafter must also exist locally and share the same tokenizer/vocabulary as the target model:

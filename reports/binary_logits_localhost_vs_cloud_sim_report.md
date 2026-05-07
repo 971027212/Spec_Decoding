@@ -191,7 +191,7 @@ python benchmark.py \
   --target-output-device cuda \
   --response-format binary \
   --response-dtype float32 \
-  --output-dir results_binary
+  --output-dir experiments/binary_logits/localhost
 ```
 
 Binary 模拟远端：
@@ -210,7 +210,7 @@ python benchmark.py \
   --sim-rtt-ms 40 \
   --sim-uplink-mbps 100 \
   --sim-downlink-mbps 200 \
-  --output-dir results_binary_cloud_sim
+  --output-dir experiments/binary_logits/cloud_sim
 ```
 
 ## 6. 实验结果
@@ -448,12 +448,12 @@ Binary localhost 下 speculative 加速约 1.24x，binary cloud sim 下约 1.30x
 
 Binary localhost：
 
-![binary localhost stacked](../results_binary/phase_stacked.png)
+![binary localhost stacked](../experiments/binary_logits/localhost/phase_stacked.png)
 
-![binary localhost boxplot](../results_binary/phase_boxplot.png)
+![binary localhost boxplot](../experiments/binary_logits/localhost/phase_boxplot.png)
 
 Binary 模拟远端：
 
-![binary cloud sim stacked](../results_binary_cloud_sim/phase_stacked.png)
+![binary cloud sim stacked](../experiments/binary_logits/cloud_sim/phase_stacked.png)
 
-![binary cloud sim boxplot](../results_binary_cloud_sim/phase_boxplot.png)
+![binary cloud sim boxplot](../experiments/binary_logits/cloud_sim/phase_boxplot.png)

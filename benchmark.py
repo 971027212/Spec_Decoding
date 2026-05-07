@@ -19,6 +19,7 @@ DEFAULT_PROMPTS = [
 PHASES_FOR_PLOTS = [
     "target_request_encode_ms",
     "drafter_generate_ms",
+    "target_forward_ms",
     "target_upload_ms",
     "target_cloud_verify_ms",
     "target_server_encode_ms",
@@ -31,7 +32,7 @@ PHASES_FOR_PLOTS = [
 
 def parse_modes(value: str) -> list[str]:
     modes = [item.strip() for item in value.split(",") if item.strip()]
-    allowed = {"speculative", "target_ar"}
+    allowed = {"speculative", "target_ar", "local_target_ar"}
     unknown = [mode for mode in modes if mode not in allowed]
     if unknown:
         raise argparse.ArgumentTypeError(f"Unsupported modes: {', '.join(unknown)}")
@@ -140,12 +141,15 @@ def run_fake(args: argparse.Namespace) -> dict[str, Path]:
                 extra={"gamma": args.gamma, "max_gen_len": args.max_tokens, "fake": True},
             )
             scale = run_index + 1
-            recorder.record("target_request_encode", 120_000 + 5_000 * scale)
-            recorder.record("target_upload", 900_000 + 25_000 * scale)
-            recorder.record("target_cloud_verify", 4_000_000 + 100_000 * scale)
-            recorder.record("target_server_encode", 700_000 + 15_000 * scale)
-            recorder.record("target_downlink", 1_100_000 + 20_000 * scale)
-            recorder.record("target_response_decode", 500_000 + 10_000 * scale)
+            if mode == "local_target_ar":
+                recorder.record("target_forward", 4_500_000 + 100_000 * scale)
+            else:
+                recorder.record("target_request_encode", 120_000 + 5_000 * scale)
+                recorder.record("target_upload", 900_000 + 25_000 * scale)
+                recorder.record("target_cloud_verify", 4_000_000 + 100_000 * scale)
+                recorder.record("target_server_encode", 700_000 + 15_000 * scale)
+                recorder.record("target_downlink", 1_100_000 + 20_000 * scale)
+                recorder.record("target_response_decode", 500_000 + 10_000 * scale)
             if mode == "speculative":
                 recorder.record("drafter_generate", 2_000_000 + 80_000 * scale)
                 recorder.record("acceptance_sampling", 200_000 + 5_000 * scale)
@@ -222,21 +226,25 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     prompts = load_prompts(args.prompts_file)
     device = _resolve_device(torch, args.device)
     dtype = _resolve_torch_dtype(torch, args.dtype)
+    remote_modes = {"speculative", "target_ar"}
+    uses_remote_target = any(mode in remote_modes for mode in modes)
     network_simulation = NetworkSimulation(
         enabled=args.simulate_network,
         rtt_ms=args.sim_rtt_ms,
         uplink_mbps=args.sim_uplink_mbps,
         downlink_mbps=args.sim_downlink_mbps,
     )
-    target = RemoteTargetModel(
-        args.target_url,
-        output_device=args.target_output_device,
-        timeout=args.timeout,
-        network_simulation=network_simulation,
-        response_format=args.response_format,
-        response_dtype=args.response_dtype,
-    )
-    tokenizer_model = args.tokenizer or target.metadata.get("model") or DEFAULT_TARGET_MODEL
+    target = None
+    if uses_remote_target:
+        target = RemoteTargetModel(
+            args.target_url,
+            output_device=args.target_output_device,
+            timeout=args.timeout,
+            network_simulation=network_simulation,
+            response_format=args.response_format,
+            response_dtype=args.response_dtype,
+        )
+    tokenizer_model = args.tokenizer or (target.metadata.get("model") if target is not None else args.local_target_model)
 
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_model,
@@ -258,6 +266,18 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
         )
         drafter.to(device)
         drafter.eval()
+
+    local_target = None
+    if "local_target_ar" in modes:
+        print(f"Loading local target model {args.local_target_model} on {device}...")
+        local_target = AutoModelForCausalLM.from_pretrained(
+            args.local_target_model,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            local_files_only=args.local_files_only,
+        )
+        local_target.to(device)
+        local_target.eval()
 
     recorders: list[TimingRecorder] = []
     processor = GreedyProcessor()
@@ -281,6 +301,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         "max_gen_len": args.max_tokens,
                         "prompt_tokens": len(input_ids),
                         "target_url": args.target_url,
+                        "local_target_model": args.local_target_model,
                         "drafter_model": args.drafter_model,
                         "response_format": args.response_format,
                         "response_dtype": args.response_dtype,
@@ -292,6 +313,8 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                 if mode == "speculative":
                     if drafter is None:
                         raise RuntimeError("Speculative mode requires a drafter model.")
+                    if target is None:
+                        raise RuntimeError("Speculative mode requires a remote target service.")
                     output_ids, accept_rate = speculative_generate(
                         input_ids,
                         drafter,
@@ -308,9 +331,25 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                     )
                     recorder.set_metric("acceptance_rate", accept_rate)
                 elif mode == "target_ar":
+                    if target is None:
+                        raise RuntimeError("target_ar mode requires a remote target service.")
                     output_ids = autoregressive_generate(
                         input_ids,
                         target,
+                        max_gen_len=args.max_tokens,
+                        logits_processor=processor,
+                        eos_tokens_id=end_tokens,
+                        pad_token_id=pad_token_id,
+                        use_cache=False,
+                        debug=False,
+                        profiler=recorder,
+                    )
+                elif mode == "local_target_ar":
+                    if local_target is None:
+                        raise RuntimeError("local_target_ar mode requires a local target model.")
+                    output_ids = autoregressive_generate(
+                        input_ids,
+                        local_target,
                         max_gen_len=args.max_tokens,
                         logits_processor=processor,
                         eos_tokens_id=end_tokens,
@@ -337,6 +376,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark speculative decoding timing distribution.")
     parser.add_argument("--target-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--local-target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--drafter-model", default=DEFAULT_DRAFTER_MODEL)
     parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--prompts-file", default=None)
