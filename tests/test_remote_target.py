@@ -31,7 +31,23 @@ class FakeTargetHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers["Content-Length"])
-        _ = self.rfile.read(length)
+        payload = json.loads(self.rfile.read(length).decode())
+        if payload.get("response_format") == "binary":
+            tensor = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]], dtype=torch.float32)
+            body = tensor.numpy().tobytes(order="C")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Target-Response-Format", "binary")
+            self.send_header("X-Target-Logits-Dtype", "float32")
+            self.send_header("X-Target-Logits-Shape", "[1,1,4]")
+            self.send_header("X-Target-Cloud-Verify-Ns", "123")
+            self.send_header("X-Target-Model-Forward-Ns", "100")
+            self.send_header("X-Target-Response-Encode-Ns", "23")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         body = json.dumps({"logits": [[[0.1, 0.2, 0.3, 0.4]]], "shape": [1, 1, 4]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -65,6 +81,30 @@ class RemoteTargetTests(unittest.TestCase):
             phases = {event["phase"] for event in recorder.events}
             self.assertIn("target_upload", phases)
             self.assertIn("target_cloud_verify", phases)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_remote_target_decodes_binary_logits(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTargetHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            target = RemoteTargetModel(url, response_format="binary", response_dtype="float32")
+            recorder = TimingRecorder(mode="speculative")
+
+            output = target(
+                torch.tensor([[1, 2, 3]]),
+                logits_start=2,
+                logits_end=3,
+                profiler=recorder,
+            )
+
+            self.assertEqual(tuple(output.logits.shape), (1, 1, 4))
+            self.assertAlmostEqual(float(output.logits[0, 0, 3]), 0.4, places=5)
+            phases = {event["phase"] for event in recorder.events}
+            self.assertIn("target_tensor_materialize", phases)
         finally:
             server.shutdown()
             server.server_close()

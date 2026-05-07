@@ -43,6 +43,11 @@ def _config_metadata(config) -> dict[str, Any]:
 def make_handler(model, model_name: str, device):
     import torch
 
+    response_dtypes = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+    }
+
     def synchronize() -> None:
         if getattr(device, "type", str(device)) == "cuda":
             torch.cuda.synchronize(device)
@@ -90,6 +95,14 @@ def make_handler(model, model_name: str, device):
 
                 logits_start = payload.get("logits_start")
                 logits_end = payload.get("logits_end")
+                response_format = payload.get("response_format", "json")
+                response_dtype_name = payload.get("response_dtype", "float32")
+                if response_format not in {"json", "binary"}:
+                    _error(self, 400, f"Unsupported response_format: {response_format}")
+                    return
+                if response_dtype_name not in response_dtypes:
+                    _error(self, 400, f"Unsupported response_dtype: {response_dtype_name}")
+                    return
 
                 synchronize()
                 forward_start = now_ns()
@@ -102,21 +115,29 @@ def make_handler(model, model_name: str, device):
                 logits = outputs.logits
                 if logits_start is not None or logits_end is not None:
                     logits = logits[..., logits_start:logits_end, :]
-                logits = logits.detach().to(device="cpu", dtype=torch.float32)
-                logits_list = logits.tolist()
+                response_dtype = response_dtypes[response_dtype_name] if response_format == "binary" else torch.float32
+                logits = logits.detach().to(device="cpu", dtype=response_dtype).contiguous()
                 cloud_verify_ns = model_forward_ns + (now_ns() - prepare_start)
 
-                response_payload = {"logits": logits_list, "shape": list(logits.shape)}
                 encode_start = now_ns()
-                response_body = json.dumps(response_payload, separators=(",", ":")).encode("utf-8")
+                if response_format == "binary":
+                    response_body = logits.numpy().tobytes(order="C")
+                    content_type = "application/octet-stream"
+                else:
+                    response_payload = {"logits": logits.tolist(), "shape": list(logits.shape)}
+                    response_body = json.dumps(response_payload, separators=(",", ":")).encode("utf-8")
+                    content_type = "application/json"
                 response_encode_ns = now_ns() - encode_start
 
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(response_body)))
                 self.send_header("X-Target-Cloud-Verify-Ns", str(cloud_verify_ns))
                 self.send_header("X-Target-Model-Forward-Ns", str(model_forward_ns))
                 self.send_header("X-Target-Response-Encode-Ns", str(response_encode_ns))
+                self.send_header("X-Target-Response-Format", response_format)
+                self.send_header("X-Target-Logits-Dtype", response_dtype_name if response_format == "binary" else "float32")
+                self.send_header("X-Target-Logits-Shape", json.dumps(list(logits.shape), separators=(",", ":")))
                 self.end_headers()
                 self.wfile.write(response_body)
             except Exception as exc:

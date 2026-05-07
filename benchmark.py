@@ -24,6 +24,7 @@ PHASES_FOR_PLOTS = [
     "target_server_encode_ms",
     "target_downlink_ms",
     "target_response_decode_ms",
+    "target_tensor_materialize_ms",
     "acceptance_sampling_ms",
 ]
 
@@ -232,6 +233,8 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
         output_device=args.target_output_device,
         timeout=args.timeout,
         network_simulation=network_simulation,
+        response_format=args.response_format,
+        response_dtype=args.response_dtype,
     )
     tokenizer_model = args.tokenizer or target.metadata.get("model") or DEFAULT_TARGET_MODEL
 
@@ -279,6 +282,8 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         "prompt_tokens": len(input_ids),
                         "target_url": args.target_url,
                         "drafter_model": args.drafter_model,
+                        "response_format": args.response_format,
+                        "response_dtype": args.response_dtype,
                         **network_simulation.metadata(),
                     },
                 )
@@ -343,6 +348,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--target-output-device", default="cpu")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    parser.add_argument("--response-format", default="json", choices=["json", "binary"])
+    parser.add_argument("--response-dtype", default="float32", choices=["float32", "float16"])
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--seed", type=int, default=42)

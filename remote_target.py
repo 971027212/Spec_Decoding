@@ -65,12 +65,20 @@ class RemoteTargetModel:
         output_device: str = "cpu",
         timeout: float = 120.0,
         network_simulation: NetworkSimulation | None = None,
+        response_format: str = "json",
+        response_dtype: str = "float32",
     ) -> None:
+        if response_format not in {"json", "binary"}:
+            raise ValueError(f"Unsupported response_format: {response_format}")
+        if response_dtype not in {"float32", "float16"}:
+            raise ValueError(f"Unsupported response_dtype: {response_dtype}")
         self.base_url = base_url.rstrip("/")
         self.output_device = output_device
         self.device = output_device
         self.timeout = timeout
         self.network_simulation = network_simulation or NetworkSimulation()
+        self.response_format = response_format
+        self.response_dtype = response_dtype
         self.metadata = self._get_json("/metadata")
         self.config = SimpleNamespace(**self.metadata.get("config", {}))
 
@@ -117,6 +125,8 @@ class RemoteTargetModel:
             "use_cache": False,
             "logits_start": logits_start,
             "logits_end": logits_end,
+            "response_format": self.response_format,
+            "response_dtype": self.response_dtype,
         }
 
         encode_start = now_ns()
@@ -135,7 +145,7 @@ class RemoteTargetModel:
             _sleep_ns(simulated_upload_ns)
             connection.putrequest("POST", f"{base_path}/forward")
             connection.putheader("Content-Type", "application/json")
-            connection.putheader("Accept", "application/json")
+            connection.putheader("Accept", "application/octet-stream" if self.response_format == "binary" else "application/json")
             connection.putheader("Content-Length", str(len(body)))
             connection.endheaders(body)
             upload_ns = now_ns() - upload_start
@@ -156,22 +166,41 @@ class RemoteTargetModel:
         total_http_ns = now_ns() - total_start
 
         decode_start = now_ns()
-        decoded = json.loads(raw_body.decode("utf-8"))
+        decoded = None
+        response_format = headers.get("x-target-response-format", "json")
+        logits_shape = None
+        logits_dtype_name = headers.get("x-target-logits-dtype", self.response_dtype)
+        if response_format == "binary":
+            logits_shape = json.loads(headers["x-target-logits-shape"])
+        else:
+            decoded = json.loads(raw_body.decode("utf-8"))
+            logits_shape = decoded.get("shape")
         decode_ns = now_ns() - decode_start
 
         if status >= 400:
+            if decoded is None:
+                decoded = json.loads(raw_body.decode("utf-8"))
             raise RuntimeError(decoded.get("error", raw_body.decode("utf-8", errors="replace")))
 
-        logits = torch.tensor(decoded["logits"], dtype=torch.float32, device=self.output_device)
+        materialize_start = now_ns()
+        if response_format == "binary":
+            dtype = torch.float16 if logits_dtype_name == "float16" else torch.float32
+            logits = torch.frombuffer(bytearray(raw_body), dtype=dtype).reshape(logits_shape)
+            logits = logits.to(device=self.output_device, dtype=torch.float32)
+        else:
+            logits = torch.tensor(decoded["logits"], dtype=torch.float32, device=self.output_device)
+        tensor_materialize_ns = now_ns() - materialize_start
 
         if profiler is not None:
             common = {
                 "status": status,
                 "request_bytes": len(body),
                 "response_bytes": len(raw_body),
+                "response_format": response_format,
+                "response_dtype": logits_dtype_name,
                 "logits_start": logits_start,
                 "logits_end": logits_end,
-                "logits_shape": decoded.get("shape"),
+                "logits_shape": logits_shape,
                 "simulated_upload_ns": simulated_upload_ns,
                 "simulated_upload_ms": simulated_upload_ns / 1_000_000,
                 "simulated_downlink_ns": simulated_downlink_ns,
@@ -185,6 +214,7 @@ class RemoteTargetModel:
             profiler.record("target_response_wait", response_wait_ns, **common)
             profiler.record("target_downlink", downlink_ns, **common)
             profiler.record("target_response_decode", decode_ns, **common)
+            profiler.record("target_tensor_materialize", tensor_materialize_ns, **common)
             profiler.record("target_http_total", total_http_ns, **common)
             _record_header_ns(profiler, headers, "x-target-cloud-verify-ns", "target_cloud_verify", common)
             _record_header_ns(profiler, headers, "x-target-model-forward-ns", "target_model_forward", common)

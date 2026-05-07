@@ -184,6 +184,21 @@ Run the benchmark in a second terminal:
 python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model Qwen/Qwen2.5-0.5B-Instruct --modes speculative,target_ar --output-dir results
 ```
 
+For lower localhost overhead, use binary logits instead of JSON logits:
+
+```bash
+python benchmark.py \
+  --target-url http://127.0.0.1:8000 \
+  --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
+  --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
+  --modes speculative,target_ar \
+  --local-files-only \
+  --target-output-device cuda \
+  --response-format binary \
+  --response-dtype float32 \
+  --output-dir results_binary
+```
+
 For offline speculative decoding, the drafter must also exist locally and share the same tokenizer/vocabulary as the target model:
 
 ```bash
