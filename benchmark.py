@@ -33,7 +33,7 @@ PHASES_FOR_PLOTS = [
 
 def parse_modes(value: str) -> list[str]:
     modes = [item.strip() for item in value.split(",") if item.strip()]
-    allowed = {"speculative", "cloud_target_generate", "target_ar", "local_target_ar"}
+    allowed = {"speculative", "speculative_server_accept", "cloud_target_generate", "target_ar", "local_target_ar"}
     unknown = [mode for mode in modes if mode not in allowed]
     if unknown:
         raise argparse.ArgumentTypeError(f"Unsupported modes: {', '.join(unknown)}")
@@ -151,6 +151,13 @@ def run_fake(args: argparse.Namespace) -> dict[str, Path]:
                 recorder.record("target_server_encode", 80_000 + 5_000 * scale)
                 recorder.record("target_downlink", 700_000 + 20_000 * scale)
                 recorder.record("target_response_decode", 100_000 + 5_000 * scale)
+            elif mode == "speculative_server_accept":
+                recorder.record("target_request_encode", 120_000 + 5_000 * scale)
+                recorder.record("target_upload", 900_000 + 25_000 * scale)
+                recorder.record("target_cloud_verify", 4_000_000 + 100_000 * scale)
+                recorder.record("target_server_encode", 80_000 + 5_000 * scale)
+                recorder.record("target_downlink", 700_000 + 20_000 * scale)
+                recorder.record("target_response_decode", 100_000 + 5_000 * scale)
             else:
                 recorder.record("target_request_encode", 120_000 + 5_000 * scale)
                 recorder.record("target_upload", 900_000 + 25_000 * scale)
@@ -158,7 +165,7 @@ def run_fake(args: argparse.Namespace) -> dict[str, Path]:
                 recorder.record("target_server_encode", 700_000 + 15_000 * scale)
                 recorder.record("target_downlink", 1_100_000 + 20_000 * scale)
                 recorder.record("target_response_decode", 500_000 + 10_000 * scale)
-            if mode == "speculative":
+            if mode in {"speculative", "speculative_server_accept"}:
                 recorder.record("drafter_generate", 2_000_000 + 80_000 * scale)
                 recorder.record("acceptance_sampling", 200_000 + 5_000 * scale)
                 recorder.set_metric("drafts_accepted", 3 + run_index)
@@ -227,14 +234,14 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from remote_target import NetworkSimulation, RemoteTargetModel
-    from sampling import autoregressive_generate, speculative_generate
+    from sampling import autoregressive_generate, speculative_generate, speculative_generate_greedy_server_accept
     from utils.logits_processor import GreedyProcessor
 
     modes = parse_modes(args.modes)
     prompts = load_prompts(args.prompts_file)
     device = _resolve_device(torch, args.device)
     dtype = _resolve_torch_dtype(torch, args.dtype)
-    remote_modes = {"speculative", "cloud_target_generate", "target_ar"}
+    remote_modes = {"speculative", "speculative_server_accept", "cloud_target_generate", "target_ar"}
     uses_remote_target = any(mode in remote_modes for mode in modes)
     network_simulation = NetworkSimulation(
         enabled=args.simulate_network,
@@ -264,7 +271,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
         pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
 
     drafter = None
-    if "speculative" in modes:
+    if any(mode in {"speculative", "speculative_server_accept"} for mode in modes):
         print(f"Loading drafter model {args.drafter_model} on {device}...")
         drafter = AutoModelForCausalLM.from_pretrained(
             args.drafter_model,
@@ -325,6 +332,26 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                     if target is None:
                         raise RuntimeError("Speculative mode requires a remote target service.")
                     output_ids, accept_rate = speculative_generate(
+                        input_ids,
+                        drafter,
+                        target,
+                        tokenizer=tokenizer,
+                        gamma=args.gamma,
+                        logits_processor=processor,
+                        max_gen_len=args.max_tokens,
+                        eos_tokens_id=end_tokens,
+                        pad_token_id=pad_token_id,
+                        use_cache=False,
+                        debug=False,
+                        profiler=recorder,
+                    )
+                    recorder.set_metric("acceptance_rate", accept_rate)
+                elif mode == "speculative_server_accept":
+                    if drafter is None:
+                        raise RuntimeError("speculative_server_accept mode requires a drafter model.")
+                    if target is None:
+                        raise RuntimeError("speculative_server_accept mode requires a remote target service.")
+                    output_ids, accept_rate = speculative_generate_greedy_server_accept(
                         input_ids,
                         drafter,
                         target,
@@ -403,9 +430,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompts-file", default=None)
     parser.add_argument(
         "--modes",
-        default="speculative,cloud_target_generate",
+        default="cloud_target_generate,speculative_server_accept",
         help=(
-            "Comma-separated modes. Main modes: speculative, cloud_target_generate, "
+            "Comma-separated modes. Main modes: speculative_server_accept, speculative, cloud_target_generate, "
             "local_target_ar. Diagnostic legacy mode: target_ar (one HTTP request per token)."
         ),
     )

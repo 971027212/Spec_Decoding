@@ -159,6 +159,8 @@ This fork adds a non-interactive timing path for single-server reproduction. The
 
 The main cloud baseline is `cloud_target_generate`: the client uploads the prompt once, the target HTTP service generates the complete answer on the cloud side, and the client downloads the final output ids once. The legacy `target_ar` mode is kept only as a diagnostic mode because it sends one HTTP request per generated token, which is not representative of normal cloud inference service behavior.
 
+The optimized edge-cloud speculative mode is `speculative_server_accept`: the client-side drafter proposes token blocks, then the target HTTP service verifies greedy acceptance server-side through `/verify_greedy` and returns only `accepted_count` plus `next_token_id`. This avoids downloading full-vocabulary logits for every speculative block. The older `speculative` mode is retained as a diagnostic logits-downlink implementation.
+
 Create and activate the Conda environment:
 
 ```bash
@@ -180,19 +182,20 @@ export TRANSFORMERS_OFFLINE=1
 python serve_target.py --model /home/chajiahao/data/hf_models/Qwen2.5-1.5B --device cuda --local-files-only
 ```
 
-Run the normal cloud target-only baseline and the edge-cloud speculative path in a second terminal:
+Run the normal cloud target-only baseline and the optimized edge-cloud speculative path in a second terminal:
 
 ```bash
 python benchmark.py \
   --target-url http://127.0.0.1:8000 \
   --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
   --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
-  --modes cloud_target_generate,speculative \
+  --modes cloud_target_generate,speculative_server_accept \
   --local-files-only \
   --target-output-device cuda \
   --response-format binary \
   --response-dtype float32 \
-  --output-dir experiments/edge_cloud/main_local
+  --device cuda \
+  --output-dir experiments/edge_cloud_optimized/local_service
 ```
 
 To measure the pure local target-only baseline without HTTP upload/downlink, stop the target service first if GPU memory is tight, then run:
@@ -204,7 +207,7 @@ python benchmark.py \
   --modes local_target_ar \
   --local-files-only \
   --device cuda \
-  --output-dir experiments/edge_cloud/local_target
+  --output-dir experiments/edge_cloud_optimized/local_target
 ```
 
 To simulate a cloud target while still running the service on the same server, add code-level network delay and bandwidth limits in the benchmark client. The example below simulates 40 ms RTT, 100 Mbps uplink, and 200 Mbps downlink:
@@ -214,23 +217,25 @@ python benchmark.py \
   --target-url http://127.0.0.1:8000 \
   --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B \
   --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
-  --modes cloud_target_generate,speculative \
+  --modes cloud_target_generate,speculative_server_accept \
   --local-files-only \
   --target-output-device cuda \
   --response-format binary \
   --response-dtype float32 \
+  --device cuda \
   --simulate-network \
   --sim-rtt-ms 40 \
   --sim-uplink-mbps 100 \
   --sim-downlink-mbps 200 \
-  --output-dir experiments/edge_cloud/cloud_sim
+  --output-dir experiments/edge_cloud_optimized/cloud_sim
 ```
 
 The supported benchmark modes are:
 
 - `local_target_ar`: pure local target-only baseline with no HTTP and no network phases.
 - `cloud_target_generate`: normal cloud target-only baseline; upload prompt once, generate the full answer in `/generate`, download final output ids once.
-- `speculative`: edge-cloud speculative decoding; local drafter generates drafts and the target HTTP service verifies draft blocks through `/forward`.
+- `speculative_server_accept`: optimized greedy edge-cloud speculative decoding; local drafter generates drafts and the target HTTP service verifies draft blocks through `/verify_greedy`, returning compact acceptance results instead of full logits.
+- `speculative`: diagnostic edge-cloud speculative decoding; local drafter generates drafts and the target HTTP service verifies draft blocks through `/forward`, returning target logits to the client.
 - `target_ar`: legacy diagnostic mode; one target HTTP request per generated token. This is useful for diagnosing RTT sensitivity but should not be used as the main cloud baseline.
 
 The benchmark writes:

@@ -232,3 +232,130 @@ def speculative_generate(
             return _finish(current_position)
     
     return _finish(total_len)
+
+
+@torch.no_grad()
+def speculative_generate_greedy_server_accept(
+    inputs: List[int],
+    drafter: Module,
+    target,
+    tokenizer = None,
+    gamma: int = 5,
+    logits_processor: LogitsProcessor = GreedyProcessor(),
+    max_gen_len: int = 40,
+    eos_tokens_id: int | List[int] = 1,
+    pad_token_id: int = 0,
+    use_cache: bool = False,
+    debug: bool = False,
+    profiler = None,
+) -> Tuple[List[int], float]:
+    """Greedy edge-cloud speculative decoding with server-side verification.
+
+    The target service returns only accepted_count and next_token_id, avoiding
+    full-vocabulary logits downlink. This path is intended for greedy timing
+    experiments and requires the remote target to implement verify_greedy().
+    """
+    if not hasattr(target, "verify_greedy"):
+        raise ValueError("speculative_generate_greedy_server_accept requires a remote target with verify_greedy().")
+    if use_cache:
+        raise ValueError("Server-accept speculative mode does not support client-side KV-cache transfer.")
+
+    drafter_cache = None
+    list_tokens_id = eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id]
+    stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=target.device).unsqueeze(1)
+
+    drafts_accepted, drafts_speculated = 0.0, 0.0
+    prompt_len = len(inputs)
+    max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
+    total_len = min(max_seq_length, prompt_len + max_gen_len)
+    input_ids = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=target.device)
+    input_ids[0, :prompt_len] = torch.tensor(inputs, dtype=torch.long, device=target.device)
+    current_position = prompt_len
+
+    def _finish(end_position: int) -> Tuple[List[int], float]:
+        output = input_ids[0, prompt_len:end_position].tolist()
+        accept_rate = drafts_accepted / drafts_speculated if drafts_speculated > 0 else 0
+        if profiler is not None:
+            profiler.set_metric("generated_tokens", len(output))
+            profiler.set_metric("drafts_accepted", int(drafts_accepted))
+            profiler.set_metric("drafts_speculated", int(drafts_speculated))
+            profiler.set_metric("acceptance_rate", accept_rate)
+            profiler.set_metric("server_accept_mode", True)
+        return output, accept_rate
+
+    def _target_step(corrected_gamma: int, call_kind: str) -> dict:
+        return target.verify_greedy(
+            input_ids[..., : current_position + corrected_gamma],
+            current_position=current_position,
+            corrected_gamma=corrected_gamma,
+            profiler=profiler,
+            profile_metadata={"call_kind": call_kind},
+        )
+
+    # Initial target token. This keeps behavior comparable to the existing
+    # speculative_generate(first_target=True) path while returning only one id.
+    result = _target_step(0, "initial")
+    first_token = torch.tensor([[result["next_token_id"]]], dtype=torch.long, device=target.device)
+    input_ids[0, current_position] = int(result["next_token_id"])
+    current_position += 1
+    if torch.isin(first_token, stop_tokens):
+        if debug:
+            printing.end_token_found(0)
+        return _finish(current_position)
+    if debug:
+        printing.initial_step(first_token, tokenizer)
+
+    while current_position < total_len:
+        corrected_gamma = min(gamma, total_len - current_position - 1)
+
+        input_ids = input_ids.to(drafter.device)
+        draft_timer = profiler.time(
+            "drafter_generate",
+            current_position=current_position,
+            corrected_gamma=corrected_gamma,
+            server_accept_mode=True,
+        ) if profiler is not None else nullcontext()
+        with draft_timer:
+            for k in range(corrected_gamma):
+                Mq = drafter(
+                    input_ids=input_ids[..., :current_position + k],
+                    past_key_values=drafter_cache,
+                    use_cache=False,
+                )
+                drafter_cache = Mq.past_key_values
+                draft_logits = Mq.logits[..., -1, :]
+                draft_probs = logits_processor(draft_logits)
+                xi = logits_processor.sample(draft_probs)
+                input_ids[0, current_position + k] = xi
+
+        drafts_speculated += corrected_gamma
+        input_ids = input_ids.to(target.device)
+
+        result = _target_step(corrected_gamma, "verify_greedy")
+        n = int(result["accepted_count"])
+        drafts_accepted += n
+
+        stop_locations = torch.nonzero(torch.eq(input_ids[..., current_position:current_position + n], stop_tokens))
+        if stop_locations.shape[0] > 0:
+            stop_location = stop_locations[0, 1].item()
+            if debug:
+                printing.end_token_found(stop_location)
+            return _finish(current_position + stop_location + 1)
+
+        next_token = torch.tensor([[int(result["next_token_id"])]], dtype=torch.long, device=target.device)
+        if debug:
+            generated = input_ids.clone().detach()
+
+        input_ids[0, current_position + n:current_position + corrected_gamma] = pad_token_id
+        input_ids[0, current_position + n] = int(result["next_token_id"])
+
+        if debug:
+            printing.speculative_step(tokenizer, generated, input_ids, n, prompt_len, current_position, corrected_gamma)
+
+        current_position += n + 1
+        if torch.isin(next_token, stop_tokens):
+            if debug:
+                printing.end_token_found(n)
+            return _finish(current_position)
+
+    return _finish(total_len)

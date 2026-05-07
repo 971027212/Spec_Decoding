@@ -86,6 +86,9 @@ def make_handler(model, model_name: str, device):
             if self.path == "/forward":
                 self._handle_forward()
                 return
+            if self.path == "/verify_greedy":
+                self._handle_verify_greedy()
+                return
             if self.path == "/generate":
                 self._handle_generate()
                 return
@@ -236,6 +239,61 @@ def make_handler(model, model_name: str, device):
             except Exception as exc:
                 _error(self, 500, str(exc))
 
+        def _handle_verify_greedy(self) -> None:
+            try:
+                payload = self._read_payload()
+                input_ids = payload["input_ids"]
+                current_position = int(payload["current_position"])
+                corrected_gamma = int(payload.get("corrected_gamma", 0))
+
+                tensor = torch.tensor(input_ids, dtype=torch.long, device=device)
+                if tensor.ndim == 1:
+                    tensor = tensor.unsqueeze(0)
+                expected_length = current_position + corrected_gamma
+                tensor = tensor[..., :expected_length]
+
+                synchronize()
+                forward_start = now_ns()
+                with torch.no_grad():
+                    outputs = model(input_ids=tensor, use_cache=False)
+                synchronize()
+                model_forward_ns = now_ns() - forward_start
+
+                verify_start = now_ns()
+                logits = outputs.logits[..., current_position - 1 : current_position + corrected_gamma, :]
+                greedy_tokens = torch.argmax(logits, dim=-1)[0]
+                accepted_count = 0
+                for offset in range(corrected_gamma):
+                    draft_token = int(tensor[0, current_position + offset].item())
+                    target_token = int(greedy_tokens[offset].item())
+                    if draft_token != target_token:
+                        break
+                    accepted_count += 1
+                next_token = int(greedy_tokens[accepted_count].item())
+                cloud_verify_ns = model_forward_ns + (now_ns() - verify_start)
+
+                encode_start = now_ns()
+                response_payload = {
+                    "accepted_count": accepted_count,
+                    "next_token_id": next_token,
+                    "verified_tokens": corrected_gamma,
+                    "all_accepted": accepted_count == corrected_gamma,
+                }
+                response_body = json.dumps(response_payload, separators=(",", ":")).encode("utf-8")
+                response_encode_ns = now_ns() - encode_start
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.send_header("X-Target-Cloud-Verify-Ns", str(cloud_verify_ns))
+                self.send_header("X-Target-Model-Forward-Ns", str(model_forward_ns))
+                self.send_header("X-Target-Response-Encode-Ns", str(response_encode_ns))
+                self.send_header("X-Target-Accepted-Count", str(accepted_count))
+                self.end_headers()
+                self.wfile.write(response_body)
+            except Exception as exc:
+                _error(self, 500, str(exc))
+
     return TargetHandler
 
 
@@ -297,7 +355,7 @@ def main() -> None:
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(model, args.model, device))
     print(f"Target service ready at http://{args.host}:{args.port}")
-    print("Endpoints: /health, /metadata, /forward, /generate")
+    print("Endpoints: /health, /metadata, /forward, /verify_greedy, /generate")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

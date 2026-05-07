@@ -44,6 +44,18 @@ class FakeTargetHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/verify_greedy":
+            body = json.dumps({"accepted_count": 1, "next_token_id": 3, "verified_tokens": 2, "all_accepted": False}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Target-Cloud-Verify-Ns", "456")
+            self.send_header("X-Target-Model-Forward-Ns", "400")
+            self.send_header("X-Target-Response-Encode-Ns", "56")
+            self.send_header("X-Target-Accepted-Count", "1")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if payload.get("response_format") == "binary":
             tensor = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]], dtype=torch.float32)
@@ -118,6 +130,32 @@ class RemoteTargetTests(unittest.TestCase):
             self.assertAlmostEqual(float(output.logits[0, 0, 3]), 0.4, places=5)
             phases = {event["phase"] for event in recorder.events}
             self.assertIn("target_tensor_materialize", phases)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_remote_target_verify_greedy_records_small_response(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTargetHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            target = RemoteTargetModel(url)
+            recorder = TimingRecorder(mode="speculative_server_accept")
+
+            result = target.verify_greedy(
+                [1, 2, 3, 4],
+                current_position=2,
+                corrected_gamma=2,
+                profiler=recorder,
+            )
+
+            self.assertEqual(result["accepted_count"], 1)
+            self.assertEqual(result["next_token_id"], 3)
+            phases = {event["phase"] for event in recorder.events}
+            self.assertIn("target_upload", phases)
+            self.assertIn("target_cloud_verify", phases)
+            self.assertIn("target_downlink", phases)
         finally:
             server.shutdown()
             server.server_close()
