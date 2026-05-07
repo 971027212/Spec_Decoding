@@ -209,20 +209,53 @@ Target-only HTTP 每生成一个 token 都要请求一次 target 服务，因此
 
 ## 6. 实验参数
 
+### 6.1 推理任务
+
+本实验的推理任务是**短文本自回归生成**：给定一条用户 prompt，让模型继续生成回答。实验不评估回答质量、准确率或任务分数，只测生成过程中的端到端延迟和各阶段时间分布。
+
+默认使用 3 条 prompt：
+
+| prompt id | prompt 内容 | 任务类型 |
+|---:|---|---|
+| 0 | `Explain speculative decoding in two concise paragraphs.` | 概念解释 |
+| 1 | `Write a short Python function that computes Fibonacci numbers.` | 代码生成 |
+| 2 | `Summarize why latency profiling matters for distributed inference.` | 技术总结 |
+
+每条 prompt 最多生成 `35` 个 token。由于启用了 tokenizer 的 chat template，实际送入模型的是用户消息格式化后的 chat prompt，而不是裸字符串直接拼接。
+
+### 6.2 模型和解码设置
+
 | 项目 | 设置 |
 |---|---|
 | Target model | `/home/chajiahao/data/hf_models/Qwen2.5-1.5B` |
 | Drafter model | `/home/chajiahao/data/hf_models/Qwen2.5-0.5B` |
-| 运行环境 | Conda `specd` |
 | 设备 | CUDA GPU server |
-| 解码策略 | Greedy |
+| 解码策略 | Greedy，使用 `GreedyProcessor` |
 | `gamma` | 4 |
 | `max_tokens` | 35 |
+| `use_cache` | `False`，远程 target 服务不维护跨请求 KV-cache |
+| seed | 42 起始，并按 prompt/run 递增设置 |
+| chat template | 启用，`--chat-template=True` |
+| 输出文本保存 | 默认不保存，除非显式加 `--save-text` |
+
+### 6.3 实验环境和统计口径
+
+| 项目 | 设置 |
+|---|---|
+| 运行环境 | Conda `specd` |
 | prompts | 默认 3 条 prompt |
 | warmup | 每个 prompt/mode 1 次 |
 | measured runs | 每个 prompt/mode 3 次，共 9 个样本 |
 | response format | binary logits, float32 |
 | cloud-sim network | RTT 40 ms, uplink 100 Mbps, downlink 200 Mbps |
+
+统计口径：
+
+- 图表和表格使用 measured runs，不包含 warmup。
+- `generation_total` 是每次生成的端到端耗时。
+- `throughput_tokens_s = generated_tokens / generation_total_seconds`。
+- `acceptance_rate` 只对 speculative 模式有意义。
+- 本实验重点是 latency profiling，不对不同输出文本做人工评分或语义质量比较。
 
 ## 7. 主实验结果
 
@@ -327,4 +360,3 @@ Target-only HTTP 每生成一个 token 都需要一次 HTTP 往返。Speculative
 3. 给 target HTTP 服务加入 KV-cache，减少重复 forward。
 4. 扫描 `gamma=2/4/6/8`，寻找通信次数和单次 response 体积的平衡点。
 5. 用真实双机或 `tc/netem` 替代代码级 sleep，验证真实网络下的时间分布。
-
