@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -154,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    parser.add_argument("--local-files-only", action="store_true", help="Load model files from local cache/path only.")
     return parser.parse_args()
 
 
@@ -163,9 +165,17 @@ def main() -> None:
     import torch
     from transformers import AutoModelForCausalLM
 
+    if args.local_files_only:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     device = _resolve_device(args.device)
     dtype = _resolve_dtype(args.dtype)
-    load_kwargs = {"trust_remote_code": True, "torch_dtype": dtype}
+    load_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": dtype,
+        "local_files_only": args.local_files_only,
+    }
     print(f"Loading target model {args.model} on {device}...")
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model.to(device)

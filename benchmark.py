@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from pathlib import Path
 from typing import Iterable
@@ -205,6 +206,10 @@ def _tokenize_prompt(tokenizer, prompt: str, use_chat_template: bool) -> list[in
 
 
 def run_real(args: argparse.Namespace) -> dict[str, Path]:
+    if args.local_files_only:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -219,19 +224,26 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     target = RemoteTargetModel(args.target_url, output_device=args.target_output_device, timeout=args.timeout)
     tokenizer_model = args.tokenizer or target.metadata.get("model") or DEFAULT_TARGET_MODEL
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_model,
+        trust_remote_code=True,
+        local_files_only=args.local_files_only,
+    )
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
 
-    print(f"Loading drafter model {args.drafter_model} on {device}...")
-    drafter = AutoModelForCausalLM.from_pretrained(
-        args.drafter_model,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-    )
-    drafter.to(device)
-    drafter.eval()
+    drafter = None
+    if "speculative" in modes:
+        print(f"Loading drafter model {args.drafter_model} on {device}...")
+        drafter = AutoModelForCausalLM.from_pretrained(
+            args.drafter_model,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            local_files_only=args.local_files_only,
+        )
+        drafter.to(device)
+        drafter.eval()
 
     recorders: list[TimingRecorder] = []
     processor = GreedyProcessor()
@@ -261,6 +273,8 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
 
                 start = now_ns()
                 if mode == "speculative":
+                    if drafter is None:
+                        raise RuntimeError("Speculative mode requires a drafter model.")
                     output_ids, accept_rate = speculative_generate(
                         input_ids,
                         drafter,
@@ -322,6 +336,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-text", action="store_true")
     parser.add_argument("--chat-template", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--local-files-only", action="store_true", help="Load tokenizer/drafter files locally only.")
     parser.add_argument("--fake", action="store_true", help="Generate synthetic timing files without loading models.")
     return parser.parse_args(argv)
 

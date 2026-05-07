@@ -170,10 +170,30 @@ Start the target service in one terminal:
 python serve_target.py --model Qwen/Qwen2.5-1.5B-Instruct --device cuda
 ```
 
+On servers without internet access, point `--model` at the local model directory and force offline loading:
+
+```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+python serve_target.py --model /home/chajiahao/data/hf_models/Qwen2.5-1.5B --device cuda --local-files-only
+```
+
 Run the benchmark in a second terminal:
 
 ```bash
 python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model Qwen/Qwen2.5-0.5B-Instruct --modes speculative,target_ar --output-dir results
+```
+
+For offline speculative decoding, the drafter must also exist locally and share the same tokenizer/vocabulary as the target model:
+
+```bash
+python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model /home/chajiahao/data/hf_models/Qwen2.5-0.5B --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B --modes speculative,target_ar --local-files-only --output-dir results
+```
+
+If only the target model is available locally, run the target autoregressive baseline first:
+
+```bash
+python benchmark.py --target-url http://127.0.0.1:8000 --tokenizer /home/chajiahao/data/hf_models/Qwen2.5-1.5B --modes target_ar --local-files-only --output-dir results_target_ar
 ```
 
 The benchmark writes:
