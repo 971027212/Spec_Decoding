@@ -1,146 +1,213 @@
-# Speculative Decoding 推理阶段耗时与占比组会汇报
+# Speculative Decoding 端云推理时间分布组会汇报
 
-## 1. 汇报目标
+## 1. 本次汇报要回答什么
 
-本次汇报的核心问题是：**speculative decoding 在端云推理过程中，每个阶段分别耗时多少、占比多少，端云通信 upload/downlink 到底占多大比例。**
+本次实验关注的不是单纯“谁更快”，而是要把 speculative decoding 推理过程拆开，看每一段分别花了多少时间：
 
-为了讲清楚这个问题，实验不是一次完成的，而是按方法逐步迭代：
+- 客户端 drafter 小模型生成 draft tokens 花多久。
+- 客户端上传请求到 target 服务花多久。
+- 服务端 target 模型验证 draft tokens 花多久。
+- 服务端把 logits 返回给客户端花多久。
+- 客户端下行接收、解析、恢复 tensor 花多久。
+- acceptance sampling 花多久。
 
-1. 先实现 target HTTP 服务，把 target model 放到“云端服务”中，客户端通过 HTTP 调用。
-2. 初版使用 JSON logits，测出完整阶段耗时。
-3. 加入远端网络模拟，拆分 upload、cloud verify、downlink。
-4. 发现 JSON 序列化严重拖慢 speculative，于是改成 binary logits。
-5. 在 binary logits 下重新跑 localhost 和模拟远端。
-6. 最后补一个纯本地 `local_target_ar`，用于确认真正无网络的 target-only 基线。
+最终目的是回答：**端云协同推理里，通信时间 upload/downlink 到底占多少，speculative decoding 能不能通过减少 target 调用次数抵消通信开销。**
 
-需要先明确一个口径：报告中的 HTTP `target_ar` 是“通过 target 服务推理”的 target-only baseline，所以它有 upload/downlink；真正没有网络传输的是 `local_target_ar`。
+## 2. 先解释实验里的几个方法
 
-## 2. 图表总览
+下面这几个名字是报告和图里的核心口径，先讲清楚，否则后面的图会不好读。
 
-### 2.1 方法迭代总耗时
+### 2.1 Pure local Target-only 是什么
 
-![Method iteration total latency](figures/method_iteration_total_latency.png)
+`Pure local Target-only` 对应代码里的 `local_target_ar`。
 
-从总耗时看，方法迭代带来的变化非常明显：
+它的含义是：
 
-| 阶段 | 模式 | 平均总耗时 ms | 吞吐 tok/s | 结论 |
-|---|---|---:|---:|---|
-| JSON localhost | `speculative` | 6763.84 | 5.60 | JSON 协议开销过大，speculative 反而慢。 |
-| JSON localhost | HTTP `target_ar` | 5642.71 | 6.24 | target-only 也被 JSON encode/decode 拖慢。 |
-| JSON cloud-sim | `speculative` | 10397.21 | 3.47 | 通信和 JSON 序列化共同成为瓶颈。 |
-| JSON cloud-sim | HTTP `target_ar` | 9634.37 | 3.63 | 仍然受 JSON 和网络共同影响。 |
-| Binary localhost | `speculative` | 1252.06 | 26.34 | binary 修复协议瓶颈后，speculative 快于 HTTP target-only。 |
-| Binary localhost | HTTP `target_ar` | 1550.38 | 22.69 | HTTP target-only 比纯本地慢。 |
-| Binary cloud-sim | `speculative` | 3095.50 | 10.59 | 远端模拟下 speculative 仍快于 HTTP target-only。 |
-| Binary cloud-sim | HTTP `target_ar` | 4024.85 | 8.70 | 网络通信成为主要开销。 |
-| Pure local | `local_target_ar` | 840.87 | 41.64 | 真正无网络 target-only，最快。 |
+- target 模型直接在 benchmark 进程里运行。
+- 不启动 `serve_target.py`。
+- 不经过 HTTP。
+- 没有 upload/downlink。
+- 每生成一个 token，直接在本地调用 target model forward。
 
-### 2.2 阶段耗时堆叠
+这个模式是**无网络、无服务化开销的理想本地基线**。它回答的问题是：如果 target 模型就在本机 GPU 上，单纯 autoregressive 推理最快能到什么水平。
 
-![Method iteration phase stacked](figures/method_iteration_phase_stacked.png)
+### 2.2 Target HTTP 是什么
 
-这张图是本报告最重要的图：它展示了每种方法下端到端耗时如何由 drafter、cloud verify、server encode、client decode、upload、downlink 等阶段组成。
+`Target HTTP` 指的是把 target 模型从 benchmark 主进程里拆出来，单独启动成一个 HTTP 服务。
 
-核心观察：
+服务端命令类似：
 
-1. JSON 阶段的大块黄色和橙色分别是 `target_server_encode` 与 `target_response_decode`，说明协议序列化是主要瓶颈。
-2. binary logits 后，server encode 和 client decode 几乎消失，总耗时大幅下降。
-3. 模拟远端后，红色 downlink 和紫色 upload 明显变大，通信成为主要瓶颈。
-4. 纯本地 target-only 只有 local target forward，没有 HTTP 和网络传输。
+```bash
+python serve_target.py \
+  --model /home/chajiahao/data/hf_models/Qwen2.5-1.5B \
+  --device cuda \
+  --local-files-only
+```
 
-### 2.3 阶段占比
+服务端只加载一次 target 模型，然后提供接口：
 
-![Method iteration phase percent](figures/method_iteration_phase_percent.png)
-
-占比图比绝对耗时更能说明瓶颈迁移：
-
-- JSON localhost：主要瓶颈是序列化/解析。
-- JSON cloud-sim：通信和序列化同时占大头。
-- Binary localhost：主要瓶颈变为 drafter 和 target verify。
-- Binary cloud-sim：通信占比上升到约一半。
-- Pure local：几乎全部是 target forward。
-
-### 2.4 端云通信专图
-
-![Method iteration communication](figures/method_iteration_communication.png)
-
-通信只统计 `target_upload + target_downlink`：
-
-| 场景 | `speculative` 通信耗时 | `speculative` 通信占比 | HTTP `target_ar` 通信耗时 | HTTP `target_ar` 通信占比 |
-|---|---:|---:|---:|---:|
-| JSON localhost | 86.83 ms | 1.28% | 70.08 ms | 1.24% |
-| JSON cloud-sim | 3547.69 ms | 34.12% | 3470.15 ms | 36.02% |
-| Binary localhost | 23.82 ms | 1.90% | 43.73 ms | 2.82% |
-| Binary cloud-sim | 1526.61 ms | 49.32% | 2306.39 ms | 57.30% |
-| Pure local | 0.00 ms | 0.00% | - | - |
-
-可以看到，localhost 的通信不是瓶颈；模拟远端后，通信占比接近或超过一半。
-
-### 2.5 JSON 到 Binary 的关键修复
-
-![JSON vs binary speculative localhost](figures/json_vs_binary_speculative_localhost.png)
-
-JSON localhost speculative 平均 `6763.84 ms`，binary localhost speculative 平均 `1252.06 ms`。主要改善来自：
-
-| 阶段 | JSON localhost speculative | Binary localhost speculative |
-|---|---:|---:|
-| `target_server_encode` | 2970.89 ms | 5.82 ms |
-| `target_response_decode` | 1182.28 ms | 0.27 ms |
-| `generation_total` | 6763.84 ms | 1252.06 ms |
-
-这说明初版 speculative 不如 target-only，并不是 speculative decoding 算法本身一定慢，而是完整 vocab logits 用 JSON 传输时，序列化和解析成本过高。
-
-## 3. 方法实现
-
-### 3.1 系统结构
-
-| 文件 | 作用 |
+| 接口 | 作用 |
 |---|---|
-| `serve_target.py` | target 模型服务端，提供 `/health`、`/metadata`、`/forward`。 |
-| `remote_target.py` | 客户端 HTTP wrapper，负责 request encode、upload、response wait、downlink、decode、tensor materialize。 |
-| `sampling/speculative_decoding.py` | speculative decoding 主循环，记录 drafter、target verify、acceptance sampling。 |
-| `sampling/base_decoding.py` | autoregressive baseline，支持 HTTP target 和纯本地 target。 |
-| `benchmark.py` | 非交互式 benchmark 入口，生成 JSONL、CSV 和 PNG 图。 |
-| `profiling.py` | 统一记录事件，生成 run summary 和 aggregate summary。 |
+| `/health` | 检查服务是否启动。 |
+| `/metadata` | 返回模型、设备、dtype 等信息。 |
+| `/forward` | 接收 `input_ids`，执行 target forward，返回 logits。 |
 
-### 3.2 推理流程
+一次 `/forward` 的流程是：
+
+1. 客户端把 `input_ids`、`logits_start`、`logits_end` 等信息编码成请求。
+2. 请求通过 HTTP 发给 target 服务，这段记为 `target_upload`。
+3. 服务端把 `input_ids` 转成 CUDA tensor。
+4. 服务端执行 target model forward。
+5. 服务端截取本轮需要的 logits。
+6. 服务端把 logits 编码成 response body。
+7. 客户端读取 response body，这段记为 `target_downlink`。
+8. 客户端解析 response，并把 binary logits 恢复成 tensor。
+
+为什么要做 Target HTTP？
+
+- 它模拟“target 大模型在云端服务，客户端只负责调度和小模型 drafter”的端云架构。
+- 它让我们能把 RTT 拆成 upload、cloud verify、downlink。
+- 它也能比较 speculative decoding 和 target-only 在“同样服务化 target”的情况下谁更快。
+
+所以要注意：**HTTP Target-only 不是纯本地 target-only。** 它虽然不用 drafter，但仍然通过 HTTP 调用 target 服务，因此一定会有 upload/downlink。
+
+### 2.3 Local service Target-only 是什么
+
+图里的 `Local service Target-only` 对应代码里的 HTTP `target_ar`，但服务端和客户端都在同一台服务器。
+
+它的含义是：
+
+- target 模型在 `serve_target.py` 里。
+- benchmark 进程通过 `http://127.0.0.1:8000/forward` 调用 target。
+- 不使用 drafter。
+- 每生成一个 token 调一次 target HTTP 服务。
+
+这个模式回答的问题是：**如果 target 被服务化，但不使用 speculative decoding，HTTP target-only 的时间分布是什么。**
+
+### 2.4 Local service Speculative 是什么
+
+图里的 `Local service Speculative` 是本地服务化版本的 speculative decoding。
+
+它的含义是：
+
+- drafter 小模型在客户端 benchmark 进程里。
+- target 大模型在 `serve_target.py` HTTP 服务里。
+- 客户端先用 drafter 一次生成多个 draft tokens。
+- 再把 draft tokens 发给 target 服务验证。
+- target 一次 forward 可以验证多个 draft tokens。
+- 客户端根据 target logits 做 acceptance sampling。
+
+这个模式的优势来源是：**减少 target HTTP 调用次数**。本次 binary 实验里，speculative 平均每个 measured run 约 `10.33` 次 target HTTP 调用，而 HTTP target-only 固定 `35` 次。
+
+### 2.5 Cloud-sim service 是什么
+
+`Cloud-sim service` 仍然是在同一台服务器上跑 client 和 target service，但在客户端代码里主动加入网络延迟，用来近似“服务端在远端云上”的情况。
+
+本次模拟参数：
+
+| 参数 | 数值 |
+|---|---:|
+| RTT | 40 ms |
+| 上行带宽 | 100 Mbps |
+| 下行带宽 | 200 Mbps |
+
+模拟公式：
+
+```text
+target_upload   = RTT / 2 + request_bytes / uplink_bandwidth
+target_downlink = RTT / 2 + response_bytes / downlink_bandwidth
+```
+
+因此：
+
+- `Local service` 表示 localhost 服务化，没有额外模拟网络。
+- `Cloud-sim service` 表示同样的服务化架构，但额外模拟远端 RTT 和带宽。
+
+它不是公网实测，但能帮助我们观察：当 target 真在远端时，upload/downlink 会如何改变时间占比。
+
+### 2.6 JSON 到 Binary 是什么
+
+一开始 `/forward` 返回 JSON 格式 logits。由于 vocab 很大，完整 logits 转成 JSON list 后非常慢，服务端 encode 和客户端 decode 都成了大瓶颈。
+
+后来改成 binary logits：
+
+- 服务端把 logits 转成连续 tensor bytes。
+- response body 直接返回二进制。
+- shape 和 dtype 放在 HTTP header。
+- 客户端用 `torch.frombuffer` 恢复 tensor。
+
+这个改动只是协议优化，不改变 speculative decoding 算法。后面的主结果都以 binary logits 为准；JSON 结果只作为“为什么要做 binary 优化”的背景简单说明。
+
+## 3. 图中的方法名对照
+
+| 图中名字 | 代码 mode | 是否 HTTP | 是否 drafter | 是否模拟远端网络 | 含义 |
+|---|---|---|---|---|---|
+| Pure local Target-only | `local_target_ar` | 否 | 否 | 否 | target 直接本地推理，无网络基线。 |
+| Local service Speculative | `speculative` | 是 | 是 | 否 | localhost target 服务 + speculative decoding。 |
+| Local service Target-only | `target_ar` | 是 | 否 | 否 | localhost target 服务 + autoregressive target-only。 |
+| Cloud-sim service Speculative | `speculative` | 是 | 是 | 是 | target 服务 + speculative + 远端网络模拟。 |
+| Cloud-sim service Target-only | `target_ar` | 是 | 否 | 是 | target 服务 + target-only + 远端网络模拟。 |
+
+## 4. 代码流程
+
+### 4.1 服务化 target 流程
 
 ```mermaid
 flowchart LR
-    P["Prompt tokens"] --> C["Client benchmark"]
-    C --> D["Drafter model<br/>Qwen2.5-0.5B"]
-    D --> Draft["Draft tokens"]
-    Draft --> U["Upload request"]
-    U --> T["Target service<br/>Qwen2.5-1.5B"]
-    T --> V["Cloud verify<br/>target forward + logits slice"]
-    V --> E["Encode logits"]
-    E --> Down["Downlink response"]
-    Down --> M["Client decode + tensor materialize"]
-    M --> A["Acceptance sampling"]
-    A --> O["Output tokens"]
+    C["Client benchmark"] --> E["Encode HTTP request"]
+    E --> U["Upload"]
+    U --> S["Target HTTP service"]
+    S --> F["Target model forward"]
+    F --> L["Slice logits"]
+    L --> B["Binary response encode"]
+    B --> D["Downlink"]
+    D --> R["Client decode + tensor materialize"]
 ```
 
-### 3.3 时间拆分口径
+### 4.2 Speculative decoding 流程
 
-本报告使用非重叠阶段统计端到端耗时：
+```mermaid
+flowchart LR
+    P["Prompt tokens"] --> D["Client drafter model"]
+    D --> Draft["Draft tokens"]
+    Draft --> T["Target HTTP verify"]
+    T --> Logits["Target logits"]
+    Logits --> A["Acceptance sampling"]
+    A --> O["Accepted output tokens"]
+```
+
+### 4.3 Target-only HTTP 流程
+
+```mermaid
+flowchart LR
+    P["Prompt tokens"] --> T1["Call target HTTP"]
+    T1 --> N1["Sample token 1"]
+    N1 --> T2["Call target HTTP again"]
+    T2 --> N2["Sample token 2"]
+    N2 --> T3["Repeat until max tokens"]
+```
+
+Target-only HTTP 每生成一个 token 都要请求一次 target 服务，因此 RTT 次数多。Speculative 每次让 drafter 先猜多个 token，再让 target 一次验证多个 token，因此 target HTTP 调用次数更少。
+
+## 5. 时间拆分口径
 
 | 阶段 | 含义 |
 |---|---|
 | `drafter_generate` | 客户端小模型生成 draft tokens。 |
-| `target_request_encode` | 客户端构造 HTTP 请求体。 |
-| `target_upload` | 请求上传；远端模拟时包含半 RTT 和上行带宽延迟。 |
+| `target_request_encode` | 客户端构造 HTTP 请求。 |
+| `target_upload` | 请求上传；cloud-sim 中包含半 RTT 和上行带宽延迟。 |
 | `target_cloud_verify` | 服务端 target forward、logits 截取、CPU 转移。 |
-| `target_server_encode` | 服务端将 logits 编码为 JSON 或 binary body。 |
-| `server_other_wait` | `target_response_wait - target_cloud_verify - target_server_encode`。 |
-| `target_downlink` | 客户端读取 response body；远端模拟时包含半 RTT 和下行带宽延迟。 |
-| `target_response_decode` | 客户端解析 response。 |
-| `target_tensor_materialize` | binary logits 恢复成 tensor。 |
-| `acceptance_sampling` | speculative 接受/拒绝采样。 |
-| `residual_other` | 总耗时扣除可观测阶段后的剩余开销。 |
+| `target_server_encode` | 服务端把 logits 编码成 response body。 |
+| `server_other_wait` | HTTP 服务框架、等待和其它服务端开销。 |
+| `target_downlink` | 客户端读取 response body；cloud-sim 中包含半 RTT 和下行带宽延迟。 |
+| `target_response_decode` | 客户端解析响应 header 或元数据。 |
+| `target_tensor_materialize` | 客户端把 binary logits 恢复成 tensor。 |
+| `acceptance_sampling` | speculative decoding 接受/拒绝采样。 |
+| `residual_other` | 端到端总时间扣除已观测阶段后的剩余开销。 |
 
-`target_model_forward` 是 `target_cloud_verify` 的内部子项，不再单独加到总占比里，避免重复计算。
+`target_model_forward` 是 `target_cloud_verify` 的内部子项，不再单独加到总占比，避免重复计算。
 
-## 4. 实验设计
+## 6. 实验参数
 
 | 项目 | 设置 |
 |---|---|
@@ -154,150 +221,110 @@ flowchart LR
 | prompts | 默认 3 条 prompt |
 | warmup | 每个 prompt/mode 1 次 |
 | measured runs | 每个 prompt/mode 3 次，共 9 个样本 |
-| binary response | `response_format=binary`, `response_dtype=float32` |
-| 远端模拟 | RTT 40 ms，上行 100 Mbps，下行 200 Mbps |
+| response format | binary logits, float32 |
+| cloud-sim network | RTT 40 ms, uplink 100 Mbps, downlink 200 Mbps |
 
-实验输出：
+## 7. 主实验结果
 
-| 文件 | 内容 |
+### 7.1 端到端总耗时
+
+![Final total latency](figures/final_total_latency.png)
+
+| 方法 | 平均总耗时 ms | P50 ms | P95 ms | 吞吐 tok/s |
+|---|---:|---:|---:|---:|
+| Pure local Target-only | 840.87 | 836.82 | 866.75 | 41.64 |
+| Local service Speculative | 1252.06 | 1274.17 | 1556.77 | 26.34 |
+| Local service Target-only | 1550.38 | 1531.48 | 1681.73 | 22.69 |
+| Cloud-sim service Speculative | 3095.50 | 3132.09 | 3742.04 | 10.59 |
+| Cloud-sim service Target-only | 4024.85 | 4023.74 | 4053.23 | 8.70 |
+
+结论：
+
+- 纯本地 target-only 最快，因为没有 HTTP 和网络。
+- 在同样使用 target HTTP 服务时，speculative 比 target-only 快。
+- cloud-sim 下两者都变慢，但 speculative 仍然更快。
+
+### 7.2 阶段耗时分布
+
+![Final phase stacked](figures/final_phase_stacked.png)
+
+这张图展示了每种方法的绝对耗时组成。重点看三件事：
+
+1. Pure local Target-only 几乎全是 `Local target forward`。
+2. Local service Speculative 的主要开销是 `Client drafter` 和 `Cloud verify`。
+3. Cloud-sim service 中红色 `Downlink` 和紫色 `Upload` 明显变大，通信变成主导因素。
+
+### 7.3 阶段占比分布
+
+![Final phase percent](figures/final_phase_percent.png)
+
+| 方法 | 主要瓶颈 |
 |---|---|
-| `raw_events.jsonl` | 每个阶段的原始事件。 |
-| `run_summary.csv` | 每次 run 的阶段汇总。 |
-| `aggregate_summary.csv` | mean、p50、p95、std 汇总。 |
-| `phase_stacked.png` | 单实验目录内的阶段堆叠图。 |
-| `phase_boxplot.png` | 单实验目录内的阶段 boxplot。 |
+| Pure local Target-only | target forward，占 97.06%。 |
+| Local service Speculative | drafter 55.91%，cloud verify 37.36%。 |
+| Local service Target-only | cloud verify 88.47%。 |
+| Cloud-sim service Speculative | downlink 42.43%，drafter 33.13%，cloud verify 14.99%。 |
+| Cloud-sim service Target-only | downlink 39.28%，cloud verify 38.88%，upload 18.02%。 |
 
-## 5. 方法迭代与结果分析
+### 7.4 通信耗时
 
-### 5.1 迭代 1：JSON logits + localhost
+![Final communication](figures/final_communication.png)
 
-目标：先实现 target 服务化和阶段计时，客户端和服务端都在同一台服务器，通过 localhost HTTP 调用。
-
-结果：
-
-| 模式 | 平均总耗时 ms | P50 ms | P95 ms | 吞吐 tok/s |
+| 方法 | upload ms | downlink ms | upload+downlink ms | 通信占比 |
 |---|---:|---:|---:|---:|
-| `speculative` | 6763.84 | 7224.99 | 9050.89 | 5.60 |
-| HTTP `target_ar` | 5642.71 | 5453.36 | 6389.75 | 6.24 |
+| Pure local Target-only | 0.00 | 0.00 | 0.00 | 0.00% |
+| Local service Speculative | 2.53 | 21.29 | 23.82 | 1.90% |
+| Local service Target-only | 17.60 | 26.13 | 43.73 | 2.82% |
+| Cloud-sim service Speculative | 213.03 | 1313.58 | 1526.61 | 49.32% |
+| Cloud-sim service Target-only | 725.46 | 1580.93 | 2306.39 | 57.30% |
 
-关键时间分布：
+结论：
 
-| 模式 | drafter | cloud verify | server encode | client decode | upload+downlink |
-|---|---:|---:|---:|---:|---:|
-| `speculative` | 1102.09 ms | 695.52 ms | 2970.89 ms | 1182.28 ms | 86.83 ms |
-| HTTP `target_ar` | 0.00 ms | 1495.02 ms | 2424.35 ms | 969.50 ms | 70.08 ms |
+- localhost 下通信不是瓶颈。
+- cloud-sim 下通信接近或超过总时间一半。
+- Speculative 在 cloud-sim 下通信占比更低，主要因为 target HTTP 调用次数少。
 
-结论：localhost 下网络本身很小，speculative 慢的核心原因是 JSON logits 序列化和解析。完整 vocab logits 通过 JSON 传输时，服务端 encode 和客户端 decode 占比过高。
+## 8. 为什么 speculative 在服务化 target 下更快
 
-### 5.2 迭代 2：JSON logits + 模拟远端
+本次 binary 实验中：
 
-目标：在 JSON 协议不变的情况下，加入 40 ms RTT、100 Mbps 上行、200 Mbps 下行，观察端云通信占比。
-
-结果：
-
-| 模式 | 平均总耗时 ms | P50 ms | P95 ms | 通信耗时 ms | 通信占比 |
-|---|---:|---:|---:|---:|---:|
-| `speculative` | 10397.21 | 11511.38 | 12226.62 | 3547.69 | 34.12% |
-| HTTP `target_ar` | 9634.37 | 9580.61 | 9877.21 | 3470.15 | 36.02% |
-
-关键时间分布：
-
-| 模式 | drafter | cloud verify | server encode | client decode | upload | downlink |
-|---|---:|---:|---:|---:|---:|---:|
-| `speculative` | 1043.22 ms | 755.80 ms | 3134.75 ms | 1215.96 ms | 252.31 ms | 3295.39 ms |
-| HTTP `target_ar` | 0.00 ms | 1586.56 ms | 2633.00 ms | 1203.55 ms | 722.58 ms | 2747.57 ms |
-
-结论：模拟远端后，通信已经占三分之一以上，但 JSON encode/decode 仍然非常大。因此第二步告诉我们：只模拟网络还不够，必须先修协议层。
-
-### 5.3 迭代 3：Binary logits + localhost
-
-目标：把 response 从 JSON logits 改成 binary logits，降低序列化和解析开销。
-
-结果：
-
-| 模式 | 平均总耗时 ms | P50 ms | P95 ms | 吞吐 tok/s | target 调用次数/run |
-|---|---:|---:|---:|---:|---:|
-| `speculative` | 1252.06 | 1274.17 | 1556.77 | 26.34 | 10.33 |
-| HTTP `target_ar` | 1550.38 | 1531.48 | 1681.73 | 22.69 | 35.00 |
-
-关键时间分布：
-
-| 阶段 | `speculative` ms | `speculative` 占比 | HTTP `target_ar` ms | HTTP `target_ar` 占比 |
-|---|---:|---:|---:|---:|
-| `drafter_generate` | 699.99 | 55.91% | 0.00 | 0.00% |
-| `target_cloud_verify` | 467.79 | 37.36% | 1371.68 | 88.47% |
-| `target_upload` | 2.53 | 0.20% | 17.60 | 1.13% |
-| `target_downlink` | 21.29 | 1.70% | 26.13 | 1.69% |
-| `target_server_encode` | 5.82 | 0.46% | 3.54 | 0.23% |
-| `target_response_decode` | 0.27 | 0.02% | 1.18 | 0.08% |
-
-结论：binary logits 后，协议层瓶颈基本消失。localhost 下 speculative 比 HTTP target-only 快 `1550.38 / 1252.06 = 1.24x`，主要原因是 target HTTP 调用从 35 次降到平均 10.33 次。
-
-### 5.4 迭代 4：Binary logits + 模拟远端
-
-目标：在修复协议瓶颈后，再模拟远端网络，看端云通信如何影响 speculative。
-
-结果：
-
-| 模式 | 平均总耗时 ms | P50 ms | P95 ms | 吞吐 tok/s | target 调用次数/run |
-|---|---:|---:|---:|---:|---:|
-| `speculative` | 3095.50 | 3132.09 | 3742.04 | 10.59 | 10.33 |
-| HTTP `target_ar` | 4024.85 | 4023.74 | 4053.23 | 8.70 | 35.00 |
-
-关键时间分布：
-
-| 阶段 | `speculative` ms | `speculative` 占比 | HTTP `target_ar` ms | HTTP `target_ar` 占比 |
-|---|---:|---:|---:|---:|
-| `drafter_generate` | 1025.43 | 33.13% | 0.00 | 0.00% |
-| `target_cloud_verify` | 464.03 | 14.99% | 1564.90 | 38.88% |
-| `target_upload` | 213.03 | 6.88% | 725.46 | 18.02% |
-| `target_downlink` | 1313.58 | 42.43% | 1580.93 | 39.28% |
-| `target_server_encode` | 6.36 | 0.21% | 4.58 | 0.11% |
-| `target_response_decode` | 0.52 | 0.02% | 1.58 | 0.04% |
-
-结论：binary 远端模拟下，通信成为核心瓶颈。speculative 的 upload+downlink 为 `1526.61 ms`，占 `49.32%`；HTTP target-only 为 `2306.39 ms`，占 `57.30%`。speculative 仍然更快，原因是它显著减少了 HTTP 往返次数。
-
-### 5.5 迭代 5：补充纯本地 target-only
-
-目标：回答“为什么 target-only 会有网络传输”。为此新增 `local_target_ar`，target 模型直接在 benchmark 进程中运行，不经过 HTTP。
-
-结果：
-
-| 模式 | 平均总耗时 ms | P50 ms | P95 ms | 吞吐 tok/s |
-|---|---:|---:|---:|---:|
-| `local_target_ar` | 840.87 | 836.82 | 866.75 | 41.64 |
-
-时间分布：
-
-| 阶段 | 平均耗时 ms | 占比 |
+| 方法 | 平均 target 调用次数/run | 平均总耗时 ms |
 |---|---:|---:|
-| `target_forward` | 816.15 | 97.06% |
-| `residual_other` | 24.72 | 2.94% |
-| upload/downlink | 0.00 | 0.00% |
+| Local service Speculative | 10.33 | 1252.06 |
+| Local service Target-only | 35.00 | 1550.38 |
+| Cloud-sim service Speculative | 10.33 | 3095.50 |
+| Cloud-sim service Target-only | 35.00 | 4024.85 |
 
-结论：纯本地 target-only 是最快的，因为没有 HTTP、没有 logits 传输、没有 drafter。它是单机理想基线；HTTP `target_ar` 是端云架构 baseline，两者不能混为一谈。
+Target-only HTTP 每生成一个 token 都需要一次 HTTP 往返。Speculative 先用本地 drafter 猜多个 token，再让 target 一次验证多个 token，因此减少了 target HTTP 调用次数。
 
-## 6. 综合结论
+在 localhost 下，减少 target verify 次数已经能带来收益。在 cloud-sim 下，减少 RTT 次数更重要，所以 speculative 相比 HTTP target-only 的优势更明显。
 
-1. **最初 speculative 不如 target-only，主要是 JSON logits 协议问题。** JSON localhost speculative 中，server encode `2970.89 ms`、client decode `1182.28 ms`，合计超过 4 秒。
-2. **binary logits 修复了协议瓶颈。** Binary localhost speculative 总耗时降到 `1252.06 ms`，比 HTTP target-only 的 `1550.38 ms` 更快。
-3. **端云通信在远端场景下是核心瓶颈。** Binary cloud-sim speculative 中 upload+downlink 占 `49.32%`，HTTP target-only 中占 `57.30%`。
-4. **speculative 在端云架构下的收益来自减少 target 往返次数。** Binary 实验中 speculative 平均 `10.33` 次 target HTTP 调用，HTTP target-only 固定 `35` 次。
-5. **纯本地 target-only 是无网络上限基线。** `local_target_ar` 平均 `840.87 ms`，说明如果 target model 本身已经很小、并且本地 GPU 可直接运行，端云 speculative 不一定比纯本地 target-only 快。
+## 9. JSON 到 Binary 的简要说明
 
-## 7. 局限性
+早期 JSON logits 结果中，Local service Speculative 平均耗时约 `6763.84 ms`，比 HTTP Target-only 的 `5642.71 ms` 更慢。主要不是 speculative 算法慢，而是完整 vocab logits 用 JSON 传输太重：
 
-1. 网络模拟是代码级 sleep，不是真实公网链路，不能覆盖 TCP 拥塞、丢包、无线抖动等现象。
-2. 客户端和服务端仍在同一台服务器，CPU/GPU 调度可能影响绝对值。
-3. 样本量为 3 个 prompt、9 个 measured runs，适合观察趋势和阶段占比，但还不足以做严格统计检验。
-4. 当前远程 target 服务默认不维护跨请求 KV-cache，会重复计算部分上下文。
-5. 当前 binary 协议仍返回完整 vocab logits，便于保持算法语义和精确 profiling，但不是最省带宽的生产协议。
+| 阶段 | JSON localhost speculative | Binary localhost speculative |
+|---|---:|---:|
+| `target_server_encode` | 2970.89 ms | 5.82 ms |
+| `target_response_decode` | 1182.28 ms | 0.27 ms |
+| `generation_total` | 6763.84 ms | 1252.06 ms |
 
-## 8. 后续优化方向
+因此后续主实验统一采用 binary logits。JSON 结果只用来说明协议优化的必要性，不作为最终性能结论。
 
-1. **降低 downlink 体积**：尝试 `response_dtype=float16`，理论上 logits body 减半。
-2. **服务端完成更多 verify/acceptance**：云端只返回 accepted tokens 和必要统计，避免完整 logits 下行。
-3. **加入 target KV-cache**：服务端维护 session cache，减少重复 forward。
-4. **扫描 gamma**：测试 gamma=2/4/6/8，找到减少 RTT 次数和增大单次 logits block 的平衡点。
-5. **真实双机或 `tc/netem` 实验**：验证代码级远端模拟结论是否能迁移到真实网络。
+## 10. 结论
+
+1. **Target HTTP 是端云架构模拟的核心。** 它把 target 模型拆成服务端，客户端通过 HTTP 请求 logits，因此可以测 upload、cloud verify、downlink。
+2. **HTTP Target-only 有网络传输是正常的。** 它不是纯本地 target-only，而是“通过 target HTTP 服务做 autoregressive 推理”。
+3. **真正无网络的 baseline 是 Pure local Target-only。** 它平均 `840.87 ms`，最快。
+4. **在服务化 target 架构下，speculative 快于 HTTP target-only。** Local service 下约 `1.24x`，cloud-sim 下约 `1.30x`。
+5. **远端模拟下通信是最大瓶颈。** Cloud-sim Speculative 的通信占 `49.32%`，Cloud-sim Target-only 的通信占 `57.30%`。
+6. **Speculative 的核心收益来自减少 target HTTP 调用次数。** 本次实验从 target-only 的 35 次/run 降到 speculative 的 10.33 次/run。
+
+## 11. 后续工作
+
+1. 用 `response_dtype=float16` 降低 logits 下行体积。
+2. 让服务端完成更多 verify/acceptance，只返回 accepted tokens，减少 downlink。
+3. 给 target HTTP 服务加入 KV-cache，减少重复 forward。
+4. 扫描 `gamma=2/4/6/8`，寻找通信次数和单次 response 体积的平衡点。
+5. 用真实双机或 `tc/netem` 替代代码级 sleep，验证真实网络下的时间分布。
 
