@@ -3,6 +3,7 @@ import torch
 from torch.nn import Module
 from utils.logits_processor import LogitsProcessor, GreedyProcessor
 import utils.printing as printing
+from sampling.model_call import model_forward
 from typing import List
 
 
@@ -16,6 +17,7 @@ def autoregressive_generate(
     pad_token_id: int = 0,
     use_cache: bool = False,
     debug: bool = False,
+    profiler = None,
 ) -> List[int]:
     """
     Generate text sequence autoregressively based on the input sequence.
@@ -49,7 +51,18 @@ def autoregressive_generate(
     stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=model.device)
 
     for curr in range(prompt_len, total_len):
-        o = model(input_ids[..., :curr], past_key_values=cache, use_cache=use_cache)
+        o = model_forward(
+            model,
+            input_ids[..., :curr],
+            past_key_values=cache,
+            use_cache=use_cache,
+            profiler=profiler,
+            phase="target_forward",
+            call_kind="autoregressive",
+            current_position=curr,
+            logits_start=curr - 1,
+            logits_end=curr,
+        )
         logits = o.logits[..., -1, :]  # [1, vocab_size]
         probs = logits_processor(logits)  # [1, vocab_size]
         x = logits_processor.sample(probs)  # [1, 1]
@@ -62,7 +75,10 @@ def autoregressive_generate(
                 printing.end_token_found(curr)
             break
 
-    return input_ids[0, prompt_len : curr + 1].tolist()
+    output = input_ids[0, prompt_len : curr + 1].tolist()
+    if profiler is not None:
+        profiler.set_metric("generated_tokens", len(output))
+    return output
 
 
 @torch.no_grad()

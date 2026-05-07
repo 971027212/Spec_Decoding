@@ -1,0 +1,74 @@
+import json
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from profiling import TimingRecorder
+from remote_target import RemoteTargetModel
+
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
+
+class FakeTargetHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_GET(self):
+        if self.path != "/metadata":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps({"model": "fake", "config": {"vocab_size": 4, "max_position_embeddings": 16}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        _ = self.rfile.read(length)
+        body = json.dumps({"logits": [[[0.1, 0.2, 0.3, 0.4]]], "shape": [1, 1, 4]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Target-Cloud-Verify-Ns", "123")
+        self.send_header("X-Target-Model-Forward-Ns", "100")
+        self.send_header("X-Target-Response-Encode-Ns", "23")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@unittest.skipIf(torch is None, "torch is not installed")
+class RemoteTargetTests(unittest.TestCase):
+    def test_remote_target_returns_logits_and_records_timings(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTargetHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            target = RemoteTargetModel(url)
+            recorder = TimingRecorder(mode="speculative")
+
+            output = target(
+                torch.tensor([[1, 2, 3]]),
+                logits_start=2,
+                logits_end=3,
+                profiler=recorder,
+            )
+
+            self.assertEqual(tuple(output.logits.shape), (1, 1, 4))
+            phases = {event["phase"] for event in recorder.events}
+            self.assertIn("target_upload", phases)
+            self.assertIn("target_cloud_verify", phases)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()

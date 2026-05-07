@@ -1,9 +1,11 @@
 import torch
 from torch.nn import Module
+from contextlib import nullcontext
 from utils.logits_processor import LogitsProcessor, GreedyProcessor
 from transformers.cache_utils import DynamicCache
 from utils.caching import prune_cache
 import utils.printing as printing
+from sampling.model_call import model_forward
 from typing import List, Tuple
 
 
@@ -34,6 +36,7 @@ def speculative_generate(
     skip_sample_adjustment: bool = False,
     first_target: bool = True,
     debug: bool = False,
+    profiler = None,
 ) -> Tuple[List[int], float]:
     """
     Generate text sequence using the speculative decoding algorithm.
@@ -80,13 +83,29 @@ def speculative_generate(
     input_ids[0, :prompt_len] = torch.tensor(inputs, dtype=torch.long, device=target.device)
     
     current_position = prompt_len
+
+    def _finish(end_position: int) -> Tuple[List[int], float]:
+        output = input_ids[0, prompt_len:end_position].tolist()
+        accept_rate = drafts_accepted / drafts_speculated if drafts_speculated > 0 else 0
+        if profiler is not None:
+            profiler.set_metric("generated_tokens", len(output))
+            profiler.set_metric("drafts_accepted", int(drafts_accepted))
+            profiler.set_metric("drafts_speculated", int(drafts_speculated))
+            profiler.set_metric("acceptance_rate", accept_rate)
+        return output, accept_rate
     
     if first_target:
         # run the target model before the speculative algorithm. Allows to prefill the kvcache and get a first token.
-        Mp = target(
+        Mp = model_forward(
+            target,
             input_ids=input_ids[..., :current_position],
             past_key_values=target_cache,
             use_cache=use_cache,
+            profiler=profiler,
+            phase="target_forward",
+            call_kind="initial",
+            logits_start=current_position - 1,
+            logits_end=current_position,
         )
         target_cache = Mp.past_key_values
         p_p = logits_processor(Mp.logits[..., -1, :])
@@ -97,7 +116,7 @@ def speculative_generate(
         if torch.isin(t, stop_tokens):
             if debug:
                 printing.end_token_found(0)
-            return input_ids[0, prompt_len:current_position].tolist(), 0
+            return _finish(current_position)
         
         if debug:
             printing.initial_step(t, tokenizer)
@@ -109,40 +128,63 @@ def speculative_generate(
         input_ids = input_ids.to(drafter.device)
         
         # generate gamma drafts
-        for k in range(corrected_gamma):
-            Mq = drafter(
-                input_ids=input_ids[..., :current_position + k],
-                past_key_values=drafter_cache,
-                use_cache=use_cache,
-            )
-            drafter_cache = Mq.past_key_values
-            
-            draft_logits = Mq.logits[..., -1, :]
-            draft_probs = logits_processor(draft_logits)
-            q[0, k] = draft_probs.to(target.device)
-            xi = logits_processor.sample(draft_probs)
-            input_ids[0, current_position + k] = xi
+        draft_timer = profiler.time(
+            "drafter_generate",
+            current_position=current_position,
+            corrected_gamma=corrected_gamma,
+        ) if profiler is not None else nullcontext()
+        with draft_timer:
+            for k in range(corrected_gamma):
+                Mq = drafter(
+                    input_ids=input_ids[..., :current_position + k],
+                    past_key_values=drafter_cache,
+                    use_cache=use_cache,
+                )
+                drafter_cache = Mq.past_key_values
+                
+                draft_logits = Mq.logits[..., -1, :]
+                draft_probs = logits_processor(draft_logits)
+                q[0, k] = draft_probs.to(target.device)
+                xi = logits_processor.sample(draft_probs)
+                input_ids[0, current_position + k] = xi
         drafts_speculated += corrected_gamma
         input_ids = input_ids.to(target.device)
         
         # run target model on drafts and get logits of the previous tokens plus one more token
-        Mp = target(
+        Mp = model_forward(
+            target,
             input_ids=input_ids[..., :current_position + corrected_gamma],
             past_key_values=target_cache,
             use_cache=use_cache,
+            profiler=profiler,
+            phase="target_forward",
+            call_kind="verify",
+            current_position=current_position,
+            corrected_gamma=corrected_gamma,
+            logits_start=current_position - 1,
+            logits_end=current_position + corrected_gamma,
         )
         target_cache = Mp.past_key_values
-        draft_logits = Mp.logits[..., current_position - 1:current_position + corrected_gamma - 1, :] # [1, corrected_gamma, vocab_size]
+        if getattr(target, "supports_logits_window", False):
+            draft_logits = Mp.logits[..., :corrected_gamma, :] # [1, corrected_gamma, vocab_size]
+        else:
+            draft_logits = Mp.logits[..., current_position - 1:current_position + corrected_gamma - 1, :] # [1, corrected_gamma, vocab_size]
         p = logits_processor(draft_logits) # [1, gamma, vocab_size]
         
         # compute the last accepted draft position (rejection sampling)
-        r = torch.rand(corrected_gamma, device=target.device)
-        fractions = p / q
-        n = corrected_gamma
-        for i in range(corrected_gamma):
-            if r[i] > fractions[0, i, input_ids[0, current_position + i]]:
-                n = i
-                break
+        accept_timer = profiler.time(
+            "acceptance_sampling",
+            current_position=current_position,
+            corrected_gamma=corrected_gamma,
+        ) if profiler is not None else nullcontext()
+        with accept_timer:
+            r = torch.rand(corrected_gamma, device=target.device)
+            fractions = p / q
+            n = corrected_gamma
+            for i in range(corrected_gamma):
+                if r[i] > fractions[0, i, input_ids[0, current_position + i]]:
+                    n = i
+                    break
         
         drafts_accepted += n
         
@@ -152,11 +194,14 @@ def speculative_generate(
             stop_location = stop_locations[0, 1].item()
             if debug:
                 printing.end_token_found(stop_location)
-            return input_ids[0, prompt_len:current_position + stop_location + 1].tolist(), drafts_accepted / drafts_speculated
+            return _finish(current_position + stop_location + 1)
 
         # adjust the distribution from Mp
         if n == corrected_gamma:
-            p_p = Mp.logits[..., current_position + corrected_gamma - 1, :]
+            if getattr(target, "supports_logits_window", False):
+                p_p = Mp.logits[..., corrected_gamma, :]
+            else:
+                p_p = Mp.logits[..., current_position + corrected_gamma - 1, :]
             p_p = logits_processor(p_p)
         else:
             # prune the cache
@@ -184,6 +229,6 @@ def speculative_generate(
         if torch.isin(x, stop_tokens):
             if debug:
                 printing.end_token_found(n)
-            return input_ids[0, prompt_len:current_position].tolist(), drafts_accepted / drafts_speculated
+            return _finish(current_position)
     
-    return input_ids[0, prompt_len:].tolist(), drafts_accepted / drafts_speculated
+    return _finish(total_len)

@@ -153,6 +153,42 @@ python infer.py
 To change the models used, you can change the `target_model_name` and `drafter_model_name` in the `infer.py` file.
 Be careful to change the generate methods to encoder-decoder models if you are using encoder-decoder models.
 
+### 3. Benchmark timing distribution with a local target service
+
+This fork adds a non-interactive timing path for single-server reproduction. The target model is served through a local HTTP process so each target call can be split into approximate upload, cloud verification, downlink, and client decode phases. Because the service usually runs on `127.0.0.1`, these upload/downlink numbers are localhost transport timings rather than public-network latency.
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the target service in one terminal:
+
+```bash
+python serve_target.py --model Qwen/Qwen2.5-1.5B-Instruct --device cuda
+```
+
+Run the benchmark in a second terminal:
+
+```bash
+python benchmark.py --target-url http://127.0.0.1:8000 --drafter-model Qwen/Qwen2.5-0.5B-Instruct --modes speculative,target_ar --output-dir results
+```
+
+The benchmark writes:
+
+- `raw_events.jsonl`: per-event timing trace.
+- `run_summary.csv`: per-run totals, token counts, throughput, and acceptance metrics.
+- `aggregate_summary.csv`: mean, p50, p95, and standard deviation by mode.
+- `phase_stacked.png` and `phase_boxplot.png`: timing distribution charts when `matplotlib` is installed.
+
+For a dependency-light smoke check that does not download models, run:
+
+```bash
+python benchmark.py --fake --runs 2 --output-dir results_fake
+python -m unittest discover -s tests
+```
+
 ## Additional content: Ngram Assisted Speculative Decoding 
 
 On top of this implementation, one of the works of my MSc thesis is implemented: **Ngram Assisted Speculative Decoding** (NASD). NASD replaces the drafter model of Speculative Decoding with an $N$-Gram Storage. The $N$-Gram Storage is a count of $k$-grams with $k \in [2, N]$. This storage takes an $N-1$ tokens context and returns the most probable next token from the highest seen $k$-gram, and `None` if the context has never been seen.
