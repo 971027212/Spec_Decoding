@@ -40,17 +40,108 @@ def _config_metadata(config) -> dict[str, Any]:
     return {key: getattr(config, key) for key in keys if hasattr(config, key)}
 
 
-def make_handler(model, model_name: str, device):
+def _parse_device_map(value: str | None) -> str | dict[str, int | str] | None:
+    if value is None or value.strip() == "" or value.lower() in {"none", "single"}:
+        return None
+    normalized = value.strip()
+    if normalized in {"auto", "balanced", "balanced_low_0", "sequential"}:
+        return normalized
+    if normalized.startswith("{"):
+        return json.loads(normalized)
+    return normalized
+
+
+def _parse_max_memory(value: str | None) -> dict[int | str, str] | None:
+    if value is None or value.strip() == "":
+        return None
+    parsed: dict[int | str, str] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, memory = item.split("=", 1)
+        elif ":" in item:
+            key, memory = item.split(":", 1)
+        else:
+            raise ValueError(f"Invalid max-memory item: {item!r}. Use entries like 0=22GiB,cpu=64GiB.")
+        key = key.strip()
+        memory = memory.strip()
+        parsed[int(key) if key.isdigit() else key] = memory
+    return parsed
+
+
+def _parse_csv(value: str | None) -> list[str] | None:
+    if value is None or value.strip() == "":
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _json_safe_device_map(model) -> dict[str, str] | None:
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        return None
+    return {str(key): str(value) for key, value in device_map.items()}
+
+
+def _normalize_cuda_device(value: Any):
+    import torch
+
+    if isinstance(value, int):
+        return torch.device("cuda", value)
+    text = str(value)
+    if text.isdigit():
+        return torch.device("cuda", int(text))
+    try:
+        device = torch.device(text)
+    except (RuntimeError, TypeError):
+        return None
+    return device if device.type == "cuda" else None
+
+
+def _infer_input_device(model, fallback):
+    try:
+        embeddings = model.get_input_embeddings()
+        if embeddings is not None:
+            for parameter in embeddings.parameters(recurse=True):
+                if parameter.device.type != "meta":
+                    return parameter.device
+    except Exception:
+        pass
+    for parameter in model.parameters():
+        if parameter.device.type != "meta":
+            return parameter.device
+    return fallback
+
+
+def _cuda_sync_devices(model, input_device) -> list[Any]:
+    import torch
+
+    devices = []
+    seen: set[str] = set()
+    device_map = getattr(model, "hf_device_map", None) or {}
+    for value in device_map.values():
+        device = _normalize_cuda_device(value)
+        if device is not None and str(device) not in seen:
+            devices.append(device)
+            seen.add(str(device))
+    if not devices and getattr(input_device, "type", str(input_device)) == "cuda":
+        devices.append(input_device if isinstance(input_device, torch.device) else torch.device(input_device))
+    return devices
+
+
+def make_handler(model, model_name: str, input_device, service_metadata: dict[str, Any] | None = None):
     import torch
 
     response_dtypes = {
         "float32": torch.float32,
         "float16": torch.float16,
     }
+    sync_devices = _cuda_sync_devices(model, input_device)
 
     def synchronize() -> None:
-        if getattr(device, "type", str(device)) == "cuda":
-            torch.cuda.synchronize(device)
+        for sync_device in sync_devices:
+            torch.cuda.synchronize(sync_device)
 
     def normalize_stop_tokens(value: Any) -> list[int]:
         if value is None:
@@ -67,7 +158,7 @@ def make_handler(model, model_name: str, device):
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                _json_response(self, 200, {"ok": True, "model": model_name, "device": str(device)})
+                _json_response(self, 200, {"ok": True, "model": model_name, "device": str(input_device), **(service_metadata or {})})
                 return
             if self.path == "/metadata":
                 _json_response(
@@ -75,8 +166,9 @@ def make_handler(model, model_name: str, device):
                     200,
                     {
                         "model": model_name,
-                        "device": str(device),
+                        "device": str(input_device),
                         "config": _config_metadata(model.config),
+                        **(service_metadata or {}),
                     },
                 )
                 return
@@ -107,7 +199,7 @@ def make_handler(model, model_name: str, device):
                     return
 
                 input_ids = payload["input_ids"]
-                tensor = torch.tensor(input_ids, dtype=torch.long, device=device)
+                tensor = torch.tensor(input_ids, dtype=torch.long, device=input_device)
                 if tensor.ndim == 1:
                     tensor = tensor.unsqueeze(0)
 
@@ -170,7 +262,7 @@ def make_handler(model, model_name: str, device):
                 eos_tokens = normalize_stop_tokens(payload.get("eos_tokens_id", payload.get("eos_token_ids")))
                 pad_token_id = int(payload.get("pad_token_id", 0))
 
-                prompt = torch.tensor(input_ids, dtype=torch.long, device=device)
+                prompt = torch.tensor(input_ids, dtype=torch.long, device=input_device)
                 if prompt.ndim == 2:
                     prompt = prompt[0]
                 prompt_len = int(prompt.numel())
@@ -180,9 +272,9 @@ def make_handler(model, model_name: str, device):
                     else (model.config.max_context_length if hasattr(model.config, "max_context_length") else 1024)
                 )
                 total_len = min(max_seq_length, prompt_len + max_gen_len)
-                sequence = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=device)
+                sequence = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=input_device)
                 sequence[0, :prompt_len] = prompt
-                stop_tokens = torch.tensor(eos_tokens, dtype=torch.long, device=device) if eos_tokens else None
+                stop_tokens = torch.tensor(eos_tokens, dtype=torch.long, device=input_device) if eos_tokens else None
 
                 generated: list[int] = []
                 model_forward_ns = 0
@@ -246,7 +338,7 @@ def make_handler(model, model_name: str, device):
                 current_position = int(payload["current_position"])
                 corrected_gamma = int(payload.get("corrected_gamma", 0))
 
-                tensor = torch.tensor(input_ids, dtype=torch.long, device=device)
+                tensor = torch.tensor(input_ids, dtype=torch.long, device=input_device)
                 if tensor.ndim == 1:
                     tensor = tensor.unsqueeze(0)
                 expected_length = current_position + corrected_gamma
@@ -325,7 +417,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="auto", help="Single-device fallback when --device-map is not set.")
+    parser.add_argument("--device-map", default=None, help="Transformers device_map, e.g. auto, balanced, balanced_low_0, sequential, or a JSON map.")
+    parser.add_argument("--max-memory", default=None, help="Comma-separated memory caps, e.g. 0=22GiB,1=22GiB,cpu=64GiB.")
+    parser.add_argument("--offload-folder", default=None, help="Folder for Accelerate CPU/disk offload when using --device-map.")
+    parser.add_argument("--no-split-module-classes", default=None, help="Comma-separated module classes that Accelerate should not split.")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--local-files-only", action="store_true", help="Load model files from local cache/path only.")
     return parser.parse_args()
@@ -343,18 +439,44 @@ def main() -> None:
 
     device = _resolve_device(args.device)
     dtype = _resolve_dtype(args.dtype)
+    device_map = _parse_device_map(args.device_map)
+    max_memory = _parse_max_memory(args.max_memory)
+    no_split_module_classes = _parse_csv(args.no_split_module_classes)
     load_kwargs = {
         "trust_remote_code": True,
         "torch_dtype": dtype,
         "local_files_only": args.local_files_only,
     }
-    print(f"Loading target model {args.model} on {device}...")
+    if device_map is not None:
+        load_kwargs["device_map"] = device_map
+    if max_memory is not None:
+        load_kwargs["max_memory"] = max_memory
+    if args.offload_folder:
+        load_kwargs["offload_folder"] = args.offload_folder
+    if no_split_module_classes:
+        load_kwargs["no_split_module_classes"] = no_split_module_classes
+
+    placement = f"device_map={device_map}" if device_map is not None else f"device={device}"
+    print(f"Loading target model {args.model} with {placement}...")
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
-    model.to(device)
+    if device_map is None:
+        model.to(device)
+        input_device = device
+    else:
+        input_device = _infer_input_device(model, device)
     model.eval()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(model, args.model, device))
+    service_metadata = {
+        "input_device": str(input_device),
+        "device_map": _json_safe_device_map(model),
+        "requested_device_map": str(device_map) if device_map is not None else None,
+        "max_memory": {str(key): value for key, value in max_memory.items()} if max_memory else None,
+    }
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(model, args.model, input_device, service_metadata))
     print(f"Target service ready at http://{args.host}:{args.port}")
+    print(f"Target input device: {input_device}")
+    if service_metadata["device_map"]:
+        print(f"Target device map: {service_metadata['device_map']}")
     print("Endpoints: /health, /metadata, /forward, /verify_greedy, /generate")
     try:
         server.serve_forever()

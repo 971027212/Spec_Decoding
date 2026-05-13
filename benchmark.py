@@ -240,6 +240,8 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
     modes = parse_modes(args.modes)
     prompts = load_prompts(args.prompts_file)
     device = _resolve_device(torch, args.device)
+    drafter_device = _resolve_device(torch, args.drafter_device) if args.drafter_device else device
+    local_target_device = _resolve_device(torch, args.local_target_device) if args.local_target_device else device
     dtype = _resolve_torch_dtype(torch, args.dtype)
     remote_modes = {"speculative", "speculative_server_accept", "cloud_target_generate", "target_ar"}
     uses_remote_target = any(mode in remote_modes for mode in modes)
@@ -259,6 +261,7 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
             response_format=args.response_format,
             response_dtype=args.response_dtype,
         )
+    target_metadata = target.metadata if target is not None else {}
     tokenizer_model = args.tokenizer or (target.metadata.get("model") if target is not None else args.local_target_model)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -272,26 +275,26 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
 
     drafter = None
     if any(mode in {"speculative", "speculative_server_accept"} for mode in modes):
-        print(f"Loading drafter model {args.drafter_model} on {device}...")
+        print(f"Loading drafter model {args.drafter_model} on {drafter_device}...")
         drafter = AutoModelForCausalLM.from_pretrained(
             args.drafter_model,
             trust_remote_code=True,
             torch_dtype=dtype,
             local_files_only=args.local_files_only,
         )
-        drafter.to(device)
+        drafter.to(drafter_device)
         drafter.eval()
 
     local_target = None
     if "local_target_ar" in modes:
-        print(f"Loading local target model {args.local_target_model} on {device}...")
+        print(f"Loading local target model {args.local_target_model} on {local_target_device}...")
         local_target = AutoModelForCausalLM.from_pretrained(
             args.local_target_model,
             trust_remote_code=True,
             torch_dtype=dtype,
             local_files_only=args.local_files_only,
         )
-        local_target.to(device)
+        local_target.to(local_target_device)
         local_target.eval()
 
     recorders: list[TimingRecorder] = []
@@ -316,8 +319,15 @@ def run_real(args: argparse.Namespace) -> dict[str, Path]:
                         "max_gen_len": args.max_tokens,
                         "prompt_tokens": len(input_ids),
                         "target_url": args.target_url,
+                        "target_service_model": target_metadata.get("model"),
+                        "target_input_device": target_metadata.get("input_device"),
+                        "target_device_map": target_metadata.get("device_map"),
+                        "target_requested_device_map": target_metadata.get("requested_device_map"),
+                        "target_output_device": args.target_output_device,
                         "local_target_model": args.local_target_model,
+                        "local_target_device": local_target_device,
                         "drafter_model": args.drafter_model,
+                        "drafter_device": drafter_device,
                         "response_format": args.response_format,
                         "response_dtype": args.response_dtype,
                         "cloud_generate_use_cache": args.cloud_use_cache,
@@ -440,7 +450,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=35)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="auto", help="Default client-side device for local models.")
+    parser.add_argument("--drafter-device", default=None, help="Device for the draft model, e.g. cuda:7. Defaults to --device.")
+    parser.add_argument("--local-target-device", default=None, help="Device for local_target_ar. Defaults to --device.")
     parser.add_argument("--target-output-device", default="cpu")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--response-format", default="json", choices=["json", "binary"])

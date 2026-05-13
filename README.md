@@ -198,6 +198,61 @@ python benchmark.py \
   --output-dir experiments/edge_cloud_optimized/local_service
 ```
 
+For a larger target that must be sharded across multiple GPUs, run the target
+service with a Transformers/Accelerate `device_map` and keep the drafter in a
+separate client process. The example below reserves physical GPU 7 for the 0.6B
+drafter and shards the 14B target across physical GPUs 0-6.
+
+If the 14B target is currently only on the A100 server, copy it to the 3090
+server first. Run this on the 3090 server and replace `A100_SERVER` with the
+hostname or IP address of the A100 machine. Make sure there is no trailing
+space after any line-continuation backslash:
+
+```bash
+mkdir -p /home/chajiahao/data/hf_models
+rsync -avh --info=progress2 \
+  chajiahao@A100_SERVER:/data/chajiahao/hf_models/Qwen3-14B \
+  /home/chajiahao/data/hf_models/
+```
+
+After the copy, the 3090 server should have both:
+
+- target: `/home/chajiahao/data/hf_models/Qwen3-14B`
+- draft: `/home/chajiahao/data/hf_models/Qwen3-0.6B`
+
+```bash
+cd /home/chajiahao/data/Spec_Decoding
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 python serve_target.py \
+  --model /home/chajiahao/data/hf_models/Qwen3-14B \
+  --device-map balanced \
+  --max-memory 0=22GiB,1=22GiB,2=22GiB,3=22GiB,4=22GiB,5=22GiB,6=22GiB,cpu=96GiB \
+  --dtype float16 \
+  --local-files-only
+```
+
+Then run the SpecD timing benchmark against that sharded target service:
+
+```bash
+cd /home/chajiahao/data/Spec_Decoding
+CUDA_VISIBLE_DEVICES=7 python benchmark.py \
+  --target-url http://127.0.0.1:8000 \
+  --drafter-model /home/chajiahao/data/hf_models/Qwen3-0.6B \
+  --tokenizer /home/chajiahao/data/hf_models/Qwen3-14B \
+  --modes cloud_target_generate,speculative_server_accept \
+  --local-files-only \
+  --target-output-device cpu \
+  --response-format binary \
+  --response-dtype float32 \
+  --device cuda:0 \
+  --drafter-device cuda:0 \
+  --output-dir experiments/flowspec_port/qwen14b_sharded_0p6b_draft
+```
+
+This is the recommended FlowSpec-to-SpecD system baseline when the drafter is a
+normal causal LM instead of an EAGLE/FlowSpec draft head. The output artifacts
+remain the same SpecD timing files: `raw_events.jsonl`, `run_summary.csv`,
+`aggregate_summary.csv`, `phase_stacked.png`, and `phase_boxplot.png`.
+
 To measure the pure local target-only baseline without HTTP upload/downlink, stop the target service first if GPU memory is tight, then run:
 
 ```bash
