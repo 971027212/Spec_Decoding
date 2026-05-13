@@ -220,6 +220,25 @@ After the copy, the 3090 server should have both:
 - target: `/home/chajiahao/data/hf_models/Qwen3-14B`
 - draft: `/home/chajiahao/data/hf_models/Qwen3-0.6B`
 
+Use the project environment instead of the base Conda environment. If `python
+--version` shows Python 3.13 or PyTorch reports that the NVIDIA driver is too
+old, create a Python 3.10 environment with a CUDA wheel compatible with the
+server driver:
+
+```bash
+conda create -n specd python=3.10 -y
+conda activate specd
+cd /home/chajiahao/data/Spec_Decoding
+pip install -r requirements.txt
+python - <<'PY'
+import torch
+print(torch.__version__)
+print(torch.version.cuda)
+print(torch.cuda.is_available())
+print(torch.cuda.device_count())
+PY
+```
+
 ```bash
 cd /home/chajiahao/data/Spec_Decoding
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 python serve_target.py \
@@ -231,6 +250,27 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 python serve_target.py \
 ```
 
 Then run the SpecD timing benchmark against that sharded target service:
+
+For a quick smoke test, use one prompt and a small token count first:
+
+```bash
+cd /home/chajiahao/data/Spec_Decoding
+CUDA_VISIBLE_DEVICES=7 python benchmark.py \
+  --target-url http://127.0.0.1:8000 \
+  --drafter-model /home/chajiahao/data/hf_models/Qwen3-0.6B \
+  --tokenizer /home/chajiahao/data/hf_models/Qwen3-14B \
+  --modes cloud_target_generate,speculative_server_accept \
+  --local-files-only \
+  --target-output-device cpu \
+  --response-format binary \
+  --response-dtype float32 \
+  --device cuda:0 \
+  --drafter-device cuda:0 \
+  --max-tokens 16 \
+  --warmup-runs 0 \
+  --runs 1 \
+  --output-dir experiments/flowspec_port/qwen14b_sharded_0p6b_smoke
+```
 
 ```bash
 cd /home/chajiahao/data/Spec_Decoding
