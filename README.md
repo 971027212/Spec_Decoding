@@ -385,7 +385,20 @@ Then run against the actual cloud and edge vLLM services:
 ```bash
 python target_placement_benchmark.py \
   --plan configs/target_placement_qwen32b_bf16.local.json \
-  --output-dir experiments/target_placement/qwen32b_bf16
+  --output-dir experiments/target_placement/qwen32b_bf16 \
+  --save-text
+```
+
+Run the first-stage greedy output sanity check on the saved text:
+
+```bash
+python quality_sanity_check.py \
+  --run-summary experiments/target_placement/qwen32b_bf16/run_summary.csv \
+  --reference cloud_a100_vllm_bf16/cloud_wan \
+  --candidate edge_3090x8_vllm_tp8_bf16/edge_lan \
+  --candidate edge_3090x8_vllm_tp4pp2_bf16/edge_lan \
+  --candidate edge_3090x8_sglang_tp8_bf16/edge_lan \
+  --concurrency-level 1
 ```
 
 The experiment rationale and recommended first-stage matrix are documented in

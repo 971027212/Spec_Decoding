@@ -107,7 +107,8 @@ python target_placement_benchmark.py \
 ```bash
 python target_placement_benchmark.py \
   --plan configs/target_placement_qwen32b_bf16.local.json \
-  --output-dir experiments/target_placement/qwen32b_bf16
+  --output-dir experiments/target_placement/qwen32b_bf16 \
+  --save-text
 ```
 
 只跑某个 placement 或网络：
@@ -131,6 +132,29 @@ python target_placement_benchmark.py \
 | `planned_runs.json` | 实际执行的 placement/network 矩阵 |
 
 当前 benchmark 的 TTFT 和 ITL 来自流式响应的 client-visible timing。prefill、decode、NCCL/通信、GPU utilization 和显存需要从 serving 框架自身 metrics、`nvidia-smi`、Nsight Systems 或框架 profiler 补充采集；这部分不要和 client-visible E2E 混为同一类指标。
+
+## 第一阶段质量 sanity check
+
+第一轮只做 greedy 输出一致性检查，不做大规模 benchmark。正式运行 benchmark 时加 `--save-text`，然后比较同一组 `prompt_id / run_index / concurrent_worker` 下 A100 和 3090x8 的输出。
+
+```bash
+python quality_sanity_check.py \
+  --run-summary experiments/target_placement/qwen32b_bf16/run_summary.csv \
+  --reference cloud_a100_vllm_bf16/cloud_wan \
+  --candidate edge_3090x8_vllm_tp8_bf16/edge_lan \
+  --candidate edge_3090x8_vllm_tp4pp2_bf16/edge_lan \
+  --candidate edge_3090x8_sglang_tp8_bf16/edge_lan \
+  --concurrency-level 1
+```
+
+输出：
+
+| 文件 | 作用 |
+|---|---|
+| `quality_sanity_detail.csv` | 每个 prompt/run 的 exact match、normalized exact match、字符相似度、首个差异位置 |
+| `quality_sanity_summary.csv` | 按 candidate 聚合 exact rate、normalized exact rate、mean/min similarity |
+
+这一步只回答“同模型同精度 greedy 输出是否明显偏离”。如果输出完全一致或高度相似，第一阶段质量 sanity 通过；如果不一致，再检查 tokenizer、chat template、served model name、dtype fallback、不同 serving 框架的 sampling 默认值是否一致。C-Eval / CMMLU / MMLU 子集放在第二步，不要抢占第一阶段延迟和瓶颈定位的主线。
 
 ## Grill-me 问题
 
