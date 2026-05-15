@@ -347,6 +347,48 @@ python benchmark.py --fake --runs 2 --output-dir results_fake
 python -m unittest discover -s tests
 ```
 
+### 4. Benchmark cloud-vs-edge target placement with vLLM
+
+This fork also includes a target-placement feasibility benchmark for existing
+LLM serving stacks such as vLLM. It calls OpenAI-compatible `/v1/completions`
+endpoints, measures streaming TTFT, end-to-end latency, approximate ITL,
+throughput, and writes placement comparison CSV files.
+
+Copy the example matrix and replace the cloud/edge hostnames:
+
+```bash
+cp configs/target_placement_qwen14b.example.json configs/target_placement_qwen14b.local.json
+```
+
+Inspect the planned cloud/edge and network-profile combinations:
+
+```bash
+python target_placement_benchmark.py \
+  --plan configs/target_placement_qwen14b.local.json \
+  --output-dir experiments/target_placement/qwen14b \
+  --dry-run
+```
+
+Run a dependency-light smoke check without starting vLLM:
+
+```bash
+python target_placement_benchmark.py \
+  --plan configs/target_placement_qwen14b.local.json \
+  --output-dir experiments/target_placement/qwen14b_fake \
+  --fake
+```
+
+Then run against the actual cloud and edge vLLM services:
+
+```bash
+python target_placement_benchmark.py \
+  --plan configs/target_placement_qwen14b.local.json \
+  --output-dir experiments/target_placement/qwen14b
+```
+
+The experiment rationale and recommended first-stage matrix are documented in
+`reports/target_placement_feasibility_plan.md`.
+
 ## Additional content: Ngram Assisted Speculative Decoding 
 
 On top of this implementation, one of the works of my MSc thesis is implemented: **Ngram Assisted Speculative Decoding** (NASD). NASD replaces the drafter model of Speculative Decoding with an $N$-Gram Storage. The $N$-Gram Storage is a count of $k$-grams with $k \in [2, N]$. This storage takes an $N-1$ tokens context and returns the most probable next token from the highest seen $k$-gram, and `None` if the context has never been seen.

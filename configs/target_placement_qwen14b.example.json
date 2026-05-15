@@ -1,0 +1,99 @@
+{
+  "name": "qwen14b_target_placement_feasibility",
+  "max_tokens": 64,
+  "warmup_runs": 1,
+  "runs": 3,
+  "temperature": 0.0,
+  "timeout": 600.0,
+  "prompts": [
+    "Explain speculative decoding in two concise paragraphs.",
+    "Write a short Python function that computes Fibonacci numbers.",
+    "Summarize why target-model placement matters for distributed LLM inference."
+  ],
+  "network_profiles": [
+    {
+      "name": "edge_lan",
+      "simulate": true,
+      "rtt_ms": 2,
+      "uplink_mbps": 1000,
+      "downlink_mbps": 1000
+    },
+    {
+      "name": "metro_edge",
+      "simulate": true,
+      "rtt_ms": 20,
+      "uplink_mbps": 100,
+      "downlink_mbps": 200
+    },
+    {
+      "name": "cloud_wan",
+      "simulate": true,
+      "rtt_ms": 80,
+      "uplink_mbps": 100,
+      "downlink_mbps": 200
+    },
+    {
+      "name": "cloud_congested",
+      "simulate": true,
+      "rtt_ms": 80,
+      "uplink_mbps": 50,
+      "downlink_mbps": 100
+    }
+  ],
+  "placements": [
+    {
+      "name": "cloud_a100_vllm",
+      "target_location": "cloud",
+      "base_url": "http://A100_SERVER:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-14B",
+      "protocol": "openai_completions",
+      "network_profiles": ["cloud_wan", "cloud_congested"]
+    },
+    {
+      "name": "edge_3090_vllm",
+      "target_location": "edge",
+      "base_url": "http://EDGE_SERVER:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-14B",
+      "protocol": "openai_completions",
+      "network_profiles": ["edge_lan", "metro_edge"]
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "edge_lan_vs_cloud_wan",
+      "mode": "target_generate",
+      "cloud": {
+        "placement": "cloud_a100_vllm",
+        "network": "cloud_wan"
+      },
+      "edge": {
+        "placement": "edge_3090_vllm",
+        "network": "edge_lan"
+      }
+    },
+    {
+      "name": "metro_edge_vs_cloud_wan",
+      "mode": "target_generate",
+      "cloud": {
+        "placement": "cloud_a100_vllm",
+        "network": "cloud_wan"
+      },
+      "edge": {
+        "placement": "edge_3090_vllm",
+        "network": "metro_edge"
+      }
+    },
+    {
+      "name": "metro_edge_vs_cloud_congested",
+      "mode": "target_generate",
+      "cloud": {
+        "placement": "cloud_a100_vllm",
+        "network": "cloud_congested"
+      },
+      "edge": {
+        "placement": "edge_3090_vllm",
+        "network": "metro_edge"
+      }
+    }
+  ]
+}
