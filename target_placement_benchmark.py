@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import time
@@ -46,6 +47,11 @@ class Placement:
     base_url: str
     model: str
     protocol: str = "openai_completions"
+    deployment_method: str = "unknown"
+    hardware: str = "unknown"
+    precision: str = "unknown"
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
     api_key_env: str | None = None
     network_profiles: tuple[str, ...] = ()
     extra_headers: dict[str, str] | None = None
@@ -113,6 +119,19 @@ def parse_placements(plan: dict[str, Any]) -> list[Placement]:
                 base_url=str(raw["base_url"]),
                 model=str(raw["model"]),
                 protocol=protocol,
+                deployment_method=str(raw.get("deployment_method", "unknown")),
+                hardware=str(raw.get("hardware", "unknown")),
+                precision=str(raw.get("precision", "unknown")),
+                tensor_parallel_size=(
+                    int(raw["tensor_parallel_size"])
+                    if raw.get("tensor_parallel_size") is not None
+                    else None
+                ),
+                pipeline_parallel_size=(
+                    int(raw["pipeline_parallel_size"])
+                    if raw.get("pipeline_parallel_size") is not None
+                    else None
+                ),
                 api_key_env=raw.get("api_key_env"),
                 network_profiles=_as_tuple(raw.get("network_profiles")),
                 extra_headers={str(key): str(value) for key, value in raw.get("extra_headers", {}).items()},
@@ -151,6 +170,16 @@ def selected_runs(
                 raise ValueError(f"Placement {placement.name} references unknown network profile {profile_name}.")
             runs.append((placement, profiles[profile_name]))
     return runs
+
+
+def concurrency_levels(plan: dict[str, Any]) -> list[int]:
+    values = plan.get("concurrency_levels", [1])
+    if isinstance(values, int):
+        values = [values]
+    levels = [int(value) for value in values]
+    if not levels or any(level < 1 for level in levels):
+        raise ValueError("concurrency_levels must contain positive integers.")
+    return levels
 
 
 def _connection(base_url: str) -> tuple[http.client.HTTPConnection, str]:
@@ -389,6 +418,107 @@ def record_completion_result(recorder: TimingRecorder, result: dict[str, Any], m
             recorder.set_metric(key, value)
 
 
+def run_request_batch(
+    placement: Placement,
+    profile: NetworkProfile,
+    prompt: str,
+    prompt_id: int,
+    iteration: int,
+    run_index: int,
+    warmup: bool,
+    concurrency_level: int,
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+    plan_name: str,
+    fake: bool,
+    save_text: bool,
+) -> list[TimingRecorder]:
+    network = profile.simulation()
+    batch_start = now_ns()
+
+    def run_worker(worker_index: int) -> tuple[int, dict[str, Any]]:
+        if fake:
+            return worker_index, run_fake_completion(
+                placement,
+                profile,
+                prompt,
+                max_tokens,
+                iteration + worker_index,
+                save_text,
+            )
+        return worker_index, run_openai_completion(
+            placement=placement,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+            network=network,
+            save_text=save_text,
+        )
+
+    results: list[tuple[int, dict[str, Any]]] = []
+    with ThreadPoolExecutor(max_workers=concurrency_level) as executor:
+        futures = [executor.submit(run_worker, worker_index) for worker_index in range(concurrency_level)]
+        for future in as_completed(futures):
+            results.append(future.result())
+    measured_batch_total_ns = now_ns() - batch_start
+    batch_total_ns = (
+        max(int(result.get("generation_total_ns") or 0) for _, result in results)
+        if fake and results
+        else measured_batch_total_ns
+    )
+
+    total_generated_tokens = sum(int(result.get("generated_tokens") or 0) for _, result in results)
+    batch_throughput_tokens_s = (
+        total_generated_tokens / (batch_total_ns / 1_000_000_000)
+        if batch_total_ns > 0
+        else None
+    )
+
+    recorders: list[TimingRecorder] = []
+    for worker_index, result in sorted(results, key=lambda item: item[0]):
+        extra = {
+            "plan": plan_name,
+            "mode": MODE,
+            "placement": placement.name,
+            "target_location": placement.target_location,
+            "network_profile": profile.name,
+            "base_url": placement.base_url,
+            "model": placement.model,
+            "protocol": placement.protocol,
+            "deployment_method": placement.deployment_method,
+            "hardware": placement.hardware,
+            "precision": placement.precision,
+            "tensor_parallel_size": placement.tensor_parallel_size,
+            "pipeline_parallel_size": placement.pipeline_parallel_size,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "concurrency_level": concurrency_level,
+            "concurrent_worker": worker_index,
+            "batch_run_index": run_index,
+            "batch_requests": concurrency_level,
+            "batch_total_tokens": total_generated_tokens,
+            "batch_total_ms": batch_total_ns / 1_000_000,
+            "batch_throughput_tokens_s": batch_throughput_tokens_s,
+            **network.metadata(),
+        }
+        recorder = TimingRecorder(
+            mode=MODE,
+            prompt_id=prompt_id,
+            run_index=run_index,
+            warmup=warmup,
+            extra=extra,
+        )
+        record_completion_result(recorder, result, metadata=extra)
+        recorder.set_metric("batch_total_tokens", total_generated_tokens)
+        recorder.set_metric("batch_total_ms", batch_total_ns / 1_000_000)
+        if batch_throughput_tokens_s is not None:
+            recorder.set_metric("batch_throughput_tokens_s", batch_throughput_tokens_s)
+        recorders.append(recorder)
+    return recorders
+
+
 def benchmark_plan(
     plan: dict[str, Any],
     output_dir: str | Path,
@@ -399,6 +529,7 @@ def benchmark_plan(
 ) -> dict[str, Path]:
     prompts = load_prompts(plan)
     runs = selected_runs(plan, placement_filter=placement_filter, network_filter=network_filter)
+    levels = concurrency_levels(plan)
     if not runs:
         raise ValueError("No placement/network runs selected.")
 
@@ -414,54 +545,43 @@ def benchmark_plan(
 
     recorders: list[TimingRecorder] = []
     for placement, profile in runs:
-        network = profile.simulation()
-        for prompt_id, prompt in enumerate(prompts):
-            for iteration in range(total_runs):
-                warmup = iteration < warmup_runs
-                run_index = iteration - warmup_runs if not warmup else iteration
-                extra = {
-                    "plan": plan_name,
-                    "mode": MODE,
-                    "placement": placement.name,
-                    "target_location": placement.target_location,
-                    "network_profile": profile.name,
-                    "base_url": placement.base_url,
-                    "model": placement.model,
-                    "protocol": placement.protocol,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    **network.metadata(),
-                }
-                recorder = TimingRecorder(
-                    mode=MODE,
-                    prompt_id=prompt_id,
-                    run_index=run_index,
-                    warmup=warmup,
-                    extra=extra,
-                )
-                if fake:
-                    result = run_fake_completion(placement, profile, prompt, max_tokens, iteration, save_text)
-                else:
-                    result = run_openai_completion(
+        for concurrency_level in levels:
+            for prompt_id, prompt in enumerate(prompts):
+                for iteration in range(total_runs):
+                    warmup = iteration < warmup_runs
+                    run_index = iteration - warmup_runs if not warmup else iteration
+                    batch_recorders = run_request_batch(
                         placement=placement,
+                        profile=profile,
                         prompt=prompt,
+                        prompt_id=prompt_id,
+                        iteration=iteration,
+                        run_index=run_index,
+                        warmup=warmup,
+                        concurrency_level=concurrency_level,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         timeout=timeout,
-                        network=network,
+                        plan_name=plan_name,
+                        fake=fake,
                         save_text=save_text,
                     )
-                record_completion_result(recorder, result, metadata=extra)
-                recorders.append(recorder)
-                label = "warmup" if warmup else "run"
-                print(
-                    f"{placement.name}/{profile.name} prompt={prompt_id} {label}={run_index} "
-                    f"ttft={result.get('ttft_ms')} e2e_ms={result['generation_total_ns'] / 1_000_000:.3f}"
-                )
+                    recorders.extend(batch_recorders)
+                    label = "warmup" if warmup else "run"
+                    batch_ms = batch_recorders[0].metrics.get("batch_total_ms") if batch_recorders else None
+                    batch_tps = batch_recorders[0].metrics.get("batch_throughput_tokens_s") if batch_recorders else None
+                    print(
+                        f"{placement.name}/{profile.name} c={concurrency_level} prompt={prompt_id} "
+                        f"{label}={run_index} batch_ms={float(batch_ms):.3f} "
+                        f"batch_tps={float(batch_tps):.3f}"
+                    )
 
     events = [event for recorder in recorders for event in recorder.events]
     summaries = [recorder.summary() for recorder in recorders]
-    aggregates = aggregate_summaries(summaries, group_keys=("mode", "placement", "target_location", "network_profile"))
+    aggregates = aggregate_summaries(
+        summaries,
+        group_keys=("mode", "placement", "target_location", "network_profile", "concurrency_level"),
+    )
     decisions = build_decision_rows(plan, aggregates)
 
     paths = {
@@ -484,6 +604,12 @@ def benchmark_plan(
                 "network_profile": profile.name,
                 "base_url": placement.base_url,
                 "model": placement.model,
+                "deployment_method": placement.deployment_method,
+                "hardware": placement.hardware,
+                "precision": placement.precision,
+                "tensor_parallel_size": placement.tensor_parallel_size,
+                "pipeline_parallel_size": placement.pipeline_parallel_size,
+                "concurrency_levels": levels,
                 "simulate_network": profile.simulate,
                 "rtt_ms": profile.rtt_ms,
                 "uplink_mbps": profile.uplink_mbps,
@@ -504,16 +630,17 @@ def _float(row: dict[str, Any], key: str) -> float:
 
 def build_decision_rows(plan: dict[str, Any], aggregates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows_by_key = {
-        (row.get("placement"), row.get("network_profile"), row.get("mode")): row
+        (row.get("placement"), row.get("network_profile"), row.get("mode"), int(row.get("concurrency_level", 1))): row
         for row in aggregates
     }
     decisions: list[dict[str, Any]] = []
     for comparison in plan.get("comparisons", []):
         mode = str(comparison.get("mode", MODE))
+        concurrency = int(comparison.get("concurrency_level", comparison.get("concurrency", 1)))
         cloud_ref = comparison["cloud"]
         edge_ref = comparison["edge"]
-        cloud_key = (cloud_ref["placement"], cloud_ref["network"], mode)
-        edge_key = (edge_ref["placement"], edge_ref["network"], mode)
+        cloud_key = (cloud_ref["placement"], cloud_ref["network"], mode, concurrency)
+        edge_key = (edge_ref["placement"], edge_ref["network"], mode, concurrency)
         cloud = rows_by_key.get(cloud_key)
         edge = rows_by_key.get(edge_key)
         if cloud is None or edge is None:
@@ -521,9 +648,10 @@ def build_decision_rows(plan: dict[str, Any], aggregates: list[dict[str, Any]]) 
                 {
                     "comparison": comparison["name"],
                     "mode": mode,
+                    "concurrency_level": concurrency,
                     "status": "missing_rows",
-                    "cloud_key": "/".join(cloud_key),
-                    "edge_key": "/".join(edge_key),
+                    "cloud_key": "/".join(str(item) for item in cloud_key),
+                    "edge_key": "/".join(str(item) for item in edge_key),
                 }
             )
             continue
@@ -538,6 +666,7 @@ def build_decision_rows(plan: dict[str, Any], aggregates: list[dict[str, Any]]) 
             {
                 "comparison": comparison["name"],
                 "mode": mode,
+                "concurrency_level": concurrency,
                 "status": "ok",
                 "cloud_placement": cloud_ref["placement"],
                 "cloud_network": cloud_ref["network"],
@@ -567,6 +696,7 @@ def write_dry_run(
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     runs = selected_runs(plan, placement_filter=placement_filter, network_filter=network_filter)
+    levels = concurrency_levels(plan)
     path = output_root / "planned_runs.json"
     write_json_array(
         path,
@@ -578,6 +708,12 @@ def write_dry_run(
                 "base_url": placement.base_url,
                 "model": placement.model,
                 "protocol": placement.protocol,
+                "deployment_method": placement.deployment_method,
+                "hardware": placement.hardware,
+                "precision": placement.precision,
+                "tensor_parallel_size": placement.tensor_parallel_size,
+                "pipeline_parallel_size": placement.pipeline_parallel_size,
+                "concurrency_levels": levels,
                 "simulate_network": profile.simulate,
                 "rtt_ms": profile.rtt_ms,
                 "uplink_mbps": profile.uplink_mbps,
@@ -591,8 +727,8 @@ def write_dry_run(
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark cloud-vs-edge target placement with vLLM/OpenAI-compatible endpoints.")
-    parser.add_argument("--plan", default="configs/target_placement_qwen14b.example.json")
-    parser.add_argument("--output-dir", default="experiments/target_placement/qwen14b")
+    parser.add_argument("--plan", default="configs/target_placement_qwen32b_bf16.example.json")
+    parser.add_argument("--output-dir", default="experiments/target_placement/qwen32b_bf16")
     parser.add_argument("--placement", default=None, help="Run only one placement name from the plan.")
     parser.add_argument("--network", default=None, help="Run only one network profile name from the plan.")
     parser.add_argument("--dry-run", action="store_true", help="Write planned_runs.json without sending requests.")

@@ -1,0 +1,165 @@
+{
+  "name": "qwen32b_bf16_target_placement_feasibility",
+  "max_tokens": 128,
+  "warmup_runs": 1,
+  "runs": 3,
+  "concurrency_levels": [1, 2, 4, 8],
+  "temperature": 0.0,
+  "timeout": 900.0,
+  "prompts": [
+    "Explain speculative decoding in two concise paragraphs.",
+    "Write a short Python function that computes Fibonacci numbers.",
+    "Summarize why target-model placement matters for distributed LLM inference."
+  ],
+  "network_profiles": [
+    {
+      "name": "edge_lan",
+      "simulate": true,
+      "rtt_ms": 2,
+      "uplink_mbps": 1000,
+      "downlink_mbps": 1000
+    },
+    {
+      "name": "metro_edge",
+      "simulate": true,
+      "rtt_ms": 20,
+      "uplink_mbps": 100,
+      "downlink_mbps": 200
+    },
+    {
+      "name": "cloud_wan",
+      "simulate": true,
+      "rtt_ms": 80,
+      "uplink_mbps": 100,
+      "downlink_mbps": 200
+    },
+    {
+      "name": "cloud_congested",
+      "simulate": true,
+      "rtt_ms": 80,
+      "uplink_mbps": 50,
+      "downlink_mbps": 100
+    }
+  ],
+  "placements": [
+    {
+      "name": "cloud_a100_vllm_bf16",
+      "target_location": "cloud",
+      "hardware": "A100",
+      "deployment_method": "vllm_single_gpu",
+      "precision": "bf16",
+      "base_url": "http://A100_SERVER:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-32B",
+      "protocol": "openai_completions",
+      "tensor_parallel_size": 1,
+      "pipeline_parallel_size": 1,
+      "network_profiles": ["cloud_wan", "cloud_congested"]
+    },
+    {
+      "name": "edge_3090x8_vllm_tp8_bf16",
+      "target_location": "edge",
+      "hardware": "8x3090",
+      "deployment_method": "vllm_tp8",
+      "precision": "bf16",
+      "base_url": "http://EDGE_SERVER_VLLM_TP8:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-32B",
+      "protocol": "openai_completions",
+      "tensor_parallel_size": 8,
+      "pipeline_parallel_size": 1,
+      "network_profiles": ["edge_lan", "metro_edge"]
+    },
+    {
+      "name": "edge_3090x8_vllm_tp4pp2_bf16",
+      "target_location": "edge",
+      "hardware": "8x3090",
+      "deployment_method": "vllm_tp4_pp2",
+      "precision": "bf16",
+      "base_url": "http://EDGE_SERVER_VLLM_TP4PP2:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-32B",
+      "protocol": "openai_completions",
+      "tensor_parallel_size": 4,
+      "pipeline_parallel_size": 2,
+      "network_profiles": ["edge_lan", "metro_edge"]
+    },
+    {
+      "name": "edge_3090x8_sglang_tp8_bf16",
+      "target_location": "edge",
+      "hardware": "8x3090",
+      "deployment_method": "sglang_tp8",
+      "precision": "bf16",
+      "base_url": "http://EDGE_SERVER_SGLANG_TP8:8000/v1",
+      "model": "/home/chajiahao/data/hf_models/Qwen3-32B",
+      "protocol": "openai_completions",
+      "tensor_parallel_size": 8,
+      "pipeline_parallel_size": 1,
+      "network_profiles": ["edge_lan", "metro_edge"]
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "edge_vllm_tp8_lan_vs_cloud_wan_c1",
+      "mode": "target_generate",
+      "concurrency_level": 1,
+      "cloud": {
+        "placement": "cloud_a100_vllm_bf16",
+        "network": "cloud_wan"
+      },
+      "edge": {
+        "placement": "edge_3090x8_vllm_tp8_bf16",
+        "network": "edge_lan"
+      }
+    },
+    {
+      "name": "edge_vllm_tp8_metro_vs_cloud_wan_c1",
+      "mode": "target_generate",
+      "concurrency_level": 1,
+      "cloud": {
+        "placement": "cloud_a100_vllm_bf16",
+        "network": "cloud_wan"
+      },
+      "edge": {
+        "placement": "edge_3090x8_vllm_tp8_bf16",
+        "network": "metro_edge"
+      }
+    },
+    {
+      "name": "edge_vllm_tp8_metro_vs_cloud_congested_c8",
+      "mode": "target_generate",
+      "concurrency_level": 8,
+      "cloud": {
+        "placement": "cloud_a100_vllm_bf16",
+        "network": "cloud_congested"
+      },
+      "edge": {
+        "placement": "edge_3090x8_vllm_tp8_bf16",
+        "network": "metro_edge"
+      }
+    },
+    {
+      "name": "edge_vllm_tp4pp2_vs_vllm_tp8_lan_c1",
+      "mode": "target_generate",
+      "concurrency_level": 1,
+      "cloud": {
+        "placement": "edge_3090x8_vllm_tp8_bf16",
+        "network": "edge_lan"
+      },
+      "edge": {
+        "placement": "edge_3090x8_vllm_tp4pp2_bf16",
+        "network": "edge_lan"
+      }
+    },
+    {
+      "name": "edge_sglang_tp8_vs_vllm_tp8_lan_c1",
+      "mode": "target_generate",
+      "concurrency_level": 1,
+      "cloud": {
+        "placement": "edge_3090x8_vllm_tp8_bf16",
+        "network": "edge_lan"
+      },
+      "edge": {
+        "placement": "edge_3090x8_sglang_tp8_bf16",
+        "network": "edge_lan"
+      }
+    }
+  ]
+}

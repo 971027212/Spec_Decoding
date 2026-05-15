@@ -347,25 +347,27 @@ python benchmark.py --fake --runs 2 --output-dir results_fake
 python -m unittest discover -s tests
 ```
 
-### 4. Benchmark cloud-vs-edge target placement with vLLM
+### 4. Benchmark cloud-vs-edge target placement with vLLM/SGLang
 
 This fork also includes a target-placement feasibility benchmark for existing
-LLM serving stacks such as vLLM. It calls OpenAI-compatible `/v1/completions`
-endpoints, measures streaming TTFT, end-to-end latency, approximate ITL,
-throughput, and writes placement comparison CSV files.
+LLM serving stacks such as vLLM and SGLang. It calls OpenAI-compatible
+`/v1/completions` endpoints, measures streaming TTFT, end-to-end latency,
+approximate ITL, throughput, and writes placement comparison CSV files. The
+first-stage matrix is Qwen3-32B BF16 with single-request latency and a small
+`1/2/4/8` concurrency sweep.
 
 Copy the example matrix and replace the cloud/edge hostnames:
 
 ```bash
-cp configs/target_placement_qwen14b.example.json configs/target_placement_qwen14b.local.json
+cp configs/target_placement_qwen32b_bf16.example.json configs/target_placement_qwen32b_bf16.local.json
 ```
 
 Inspect the planned cloud/edge and network-profile combinations:
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16 \
   --dry-run
 ```
 
@@ -373,8 +375,8 @@ Run a dependency-light smoke check without starting vLLM:
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b_fake \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16_fake \
   --fake
 ```
 
@@ -382,8 +384,8 @@ Then run against the actual cloud and edge vLLM services:
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16
 ```
 
 The experiment rationale and recommended first-stage matrix are documented in

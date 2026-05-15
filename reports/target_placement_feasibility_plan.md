@@ -12,16 +12,17 @@
 边缘 target 计算变慢的额外成本
 ```
 
-第一阶段先用 vLLM/OpenAI-compatible endpoint 做 target-only 黑盒服务比较。这样可以避开自写 serving stack 的干扰，先把“成熟部署方法下 target 下沉是否可行”测清楚。
+第一阶段先用 vLLM/SGLang 这类 OpenAI-compatible endpoint 做 target-only 黑盒服务比较。这样可以避开自写 serving stack 的干扰，先把“成熟部署方法下 target 下沉是否可行”测清楚。
 
 ## 推荐变量
 
 | 变量 | 第一阶段固定/变化 | 原因 |
 |---|---|---|
-| 模型 | 先固定 Qwen3-14B | 保证云端和边缘比较的是同一个 target |
-| 精度 | 先固定 BF16/FP16；第二轮再加 INT4/INT8 | 第一轮先分离 placement 影响，第二轮再研究质量-延迟权衡 |
-| serving | vLLM OpenAI-compatible server | 代表现有成熟部署方法 |
+| 模型 | 固定 Qwen3-32B | 保证云端和边缘比较的是同一个大 target，也符合单张 3090 放不下的研究设定 |
+| 精度 | 固定 BF16 | 第一轮先分离 placement 影响，第二轮再研究 INT4/INT8 的质量-延迟权衡 |
+| serving | vLLM single GPU、vLLM TP8、vLLM TP4PP2、SGLang TP8 | 比较多种成熟端边分布式部署方法 |
 | 网络 | edge_lan、metro_edge、cloud_wan、cloud_congested | 覆盖边缘近端、城域边缘、远端云和拥塞云 |
+| 并发 | 1、2、4、8 | 先测单请求基础延迟，再测小并发下 queueing/batching 分叉 |
 | 指标 | TTFT、E2E、近似 ITL、throughput、p50/p95 | 不只看平均 ITL |
 
 ## 启动服务
@@ -30,8 +31,9 @@
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /home/chajiahao/data/hf_models/Qwen3-14B \
-  --served-model-name /home/chajiahao/data/hf_models/Qwen3-14B \
+  --model /home/chajiahao/data/hf_models/Qwen3-32B \
+  --served-model-name /home/chajiahao/data/hf_models/Qwen3-32B \
+  --dtype bfloat16 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -40,28 +42,54 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /home/chajiahao/data/hf_models/Qwen3-14B \
-  --served-model-name /home/chajiahao/data/hf_models/Qwen3-14B \
+  --model /home/chajiahao/data/hf_models/Qwen3-32B \
+  --served-model-name /home/chajiahao/data/hf_models/Qwen3-32B \
+  --tensor-parallel-size 8 \
+  --dtype bfloat16 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-如果边缘单卡放不下 14B，可以先用 vLLM 支持的 tensor parallel 或量化版本。注意：一旦边缘用了 INT4/INT8 或更小模型，这组实验就从“同 target placement”变成“质量-延迟 trade-off”，报告里要单独标注。
+边缘 vLLM TP4PP2 示例：
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model /home/chajiahao/data/hf_models/Qwen3-32B \
+  --served-model-name /home/chajiahao/data/hf_models/Qwen3-32B \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
+  --dtype bfloat16 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+边缘 SGLang TP8 示例：
+
+```bash
+python -m sglang.launch_server \
+  --model-path /home/chajiahao/data/hf_models/Qwen3-32B \
+  --tp 8 \
+  --dtype bfloat16 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+注意：第一轮不要用 INT4/INT8 或更小模型。一旦边缘用了量化或小模型，这组实验就从“同 target placement”变成“质量-延迟 trade-off”，报告里要单独标注。
 
 ## 运行 benchmark
 
-先复制示例配置并替换 `A100_SERVER`、`EDGE_SERVER`：
+先复制示例配置并替换 `A100_SERVER`、`EDGE_SERVER_VLLM_TP8`、`EDGE_SERVER_VLLM_TP4PP2`、`EDGE_SERVER_SGLANG_TP8`：
 
 ```bash
-cp configs/target_placement_qwen14b.example.json configs/target_placement_qwen14b.local.json
+cp configs/target_placement_qwen32b_bf16.example.json configs/target_placement_qwen32b_bf16.local.json
 ```
 
 查看计划，不发送请求：
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16 \
   --dry-run
 ```
 
@@ -69,8 +97,8 @@ python target_placement_benchmark.py \
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b_fake \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16_fake \
   --fake
 ```
 
@@ -78,18 +106,18 @@ python target_placement_benchmark.py \
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --output-dir experiments/target_placement/qwen14b
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-dir experiments/target_placement/qwen32b_bf16
 ```
 
 只跑某个 placement 或网络：
 
 ```bash
 python target_placement_benchmark.py \
-  --plan configs/target_placement_qwen14b.local.json \
-  --placement edge_3090_vllm \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --placement edge_3090x8_vllm_tp8_bf16 \
   --network metro_edge \
-  --output-dir experiments/target_placement/qwen14b_edge_metro
+  --output-dir experiments/target_placement/qwen32b_bf16_edge_metro
 ```
 
 ## 输出文件
@@ -98,9 +126,11 @@ python target_placement_benchmark.py \
 |---|---|
 | `raw_events.jsonl` | 每次请求的 phase-level timing |
 | `run_summary.csv` | 每个 prompt/run 的 TTFT、E2E、近似 ITL、throughput |
-| `aggregate_summary.csv` | 按 placement/network 聚合的 mean、p50、p95、std |
+| `aggregate_summary.csv` | 按 placement/network/concurrency 聚合的 mean、p50、p95、std |
 | `placement_decisions.csv` | 根据配置里的 comparisons 输出云端 vs 边缘对照 |
 | `planned_runs.json` | 实际执行的 placement/network 矩阵 |
+
+当前 benchmark 的 TTFT 和 ITL 来自流式响应的 client-visible timing。prefill、decode、NCCL/通信、GPU utilization 和显存需要从 serving 框架自身 metrics、`nvidia-smi`、Nsight Systems 或框架 profiler 补充采集；这部分不要和 client-visible E2E 混为同一类指标。
 
 ## Grill-me 问题
 

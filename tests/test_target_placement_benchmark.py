@@ -12,6 +12,7 @@ def minimal_plan():
         "max_tokens": 4,
         "warmup_runs": 0,
         "runs": 1,
+        "concurrency_levels": [1, 2],
         "network_profiles": [
             {"name": "cloud_wan", "simulate": True, "rtt_ms": 80, "uplink_mbps": 100, "downlink_mbps": 200},
             {"name": "edge_lan", "simulate": True, "rtt_ms": 2, "uplink_mbps": 1000, "downlink_mbps": 1000},
@@ -95,6 +96,11 @@ class TargetPlacementBenchmarkTests(unittest.TestCase):
 
             self.assertEqual(decisions[0]["comparison"], "edge_lan_vs_cloud_wan")
             self.assertEqual(decisions[0]["status"], "ok")
+
+            with Path(paths["aggregate_summary"]).open(newline="", encoding="utf-8") as handle:
+                aggregates = list(csv.DictReader(handle))
+
+            self.assertEqual({row["concurrency_level"] for row in aggregates}, {"1", "2"})
 
 
 if __name__ == "__main__":
