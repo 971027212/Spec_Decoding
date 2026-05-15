@@ -731,6 +731,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="experiments/target_placement/qwen32b_bf16")
     parser.add_argument("--placement", default=None, help="Run only one placement name from the plan.")
     parser.add_argument("--network", default=None, help="Run only one network profile name from the plan.")
+    parser.add_argument("--concurrency-level", type=int, default=None, help="Override the plan and run only one concurrency level.")
     parser.add_argument("--dry-run", action="store_true", help="Write planned_runs.json without sending requests.")
     parser.add_argument("--fake", action="store_true", help="Generate synthetic timing artifacts without a serving endpoint.")
     parser.add_argument("--save-text", action="store_true", help="Store generated text in run_summary.csv.")
@@ -740,6 +741,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> None:
     args = parse_args(argv)
     plan = load_plan(args.plan)
+    if args.concurrency_level is not None:
+        plan = {**plan, "concurrency_levels": [args.concurrency_level]}
     if args.dry_run:
         path = write_dry_run(plan, args.output_dir, placement_filter=args.placement, network_filter=args.network)
         print(f"Wrote planned runs: {path}")

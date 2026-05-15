@@ -389,6 +389,28 @@ python target_placement_benchmark.py \
   --save-text
 ```
 
+Collect lightweight GPU utilization and memory samples while the benchmark runs:
+
+```bash
+python gpu_monitor.py run \
+  --output-dir experiments/target_placement/qwen32b_bf16_gpu \
+  --sample-interval-ms 1000 \
+  --dmon-interval-s 1 \
+  -- \
+  python target_placement_benchmark.py \
+    --plan configs/target_placement_qwen32b_bf16.local.json \
+    --placement edge_3090x8_vllm_tp8_bf16 \
+    --network edge_lan \
+    --concurrency-level 1 \
+    --output-dir experiments/target_placement/qwen32b_bf16_edge_tp8 \
+    --save-text
+```
+
+This writes `gpu_metrics.csv`, `gpu_metrics_summary.csv`, and the raw
+`nvidia-smi dmon` log `gpu_dmon_raw.log`. Use Nsight Systems only on the
+one or two most important serving runs when NCCL or inter-GPU communication
+needs deeper diagnosis.
+
 Run the first-stage greedy output sanity check on the saved text:
 
 ```bash

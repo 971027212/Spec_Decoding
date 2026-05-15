@@ -133,6 +133,59 @@ python target_placement_benchmark.py \
 
 当前 benchmark 的 TTFT 和 ITL 来自流式响应的 client-visible timing。prefill、decode、NCCL/通信、GPU utilization 和显存需要从 serving 框架自身 metrics、`nvidia-smi`、Nsight Systems 或框架 profiler 补充采集；这部分不要和 client-visible E2E 混为同一类指标。
 
+## 第一阶段时间分布采集
+
+第一轮采用三层采集，不把所有 profiler 都打开：
+
+| 层级 | 工具 | 覆盖范围 | 输出 |
+|---|---|---|---|
+| client-visible | `target_placement_benchmark.py` | TTFT、近似 ITL、E2E、batch throughput、网络模拟 | `raw_events.jsonl`、`run_summary.csv`、`aggregate_summary.csv` |
+| GPU 轻量采样 | `gpu_monitor.py` + `nvidia-smi` / `nvidia-smi dmon` | GPU utilization、显存、功耗、温度 | `gpu_metrics.csv`、`gpu_metrics_summary.csv`、`gpu_dmon_raw.log` |
+| 深度通信分析 | Nsight Systems | 只给 1-2 个关键部署抓 CUDA/NCCL/通信 | `.nsys-rep` |
+
+轻量 GPU 采样示例：
+
+```bash
+python gpu_monitor.py run \
+  --output-dir experiments/target_placement/qwen32b_bf16_gpu \
+  --sample-interval-ms 1000 \
+  --dmon-interval-s 1 \
+  -- \
+  python target_placement_benchmark.py \
+    --plan configs/target_placement_qwen32b_bf16.local.json \
+    --placement edge_3090x8_vllm_tp8_bf16 \
+    --network edge_lan \
+    --concurrency-level 1 \
+    --output-dir experiments/target_placement/qwen32b_bf16_edge_tp8 \
+    --save-text
+```
+
+`gpu_monitor.py` 会保存结构化 `gpu_metrics.csv` 便于画图/汇总，同时保存原始 `gpu_dmon_raw.log` 作为第一轮资源曲线证据。已有 CSV 也可以单独汇总：
+
+```bash
+python gpu_monitor.py summarize \
+  --metrics-csv experiments/target_placement/qwen32b_bf16_gpu/gpu_metrics.csv \
+  --output-csv experiments/target_placement/qwen32b_bf16_gpu/gpu_metrics_summary.csv
+```
+
+Nsight Systems 只放在关键对照上，例如 edge vLLM TP8 和 TP4PP2。建议抓 serving 进程而不是 client benchmark 进程，因为模型计算和 NCCL 通信发生在服务端：
+
+```bash
+nsys profile \
+  --trace=cuda,nvtx,osrt,cublas,nccl \
+  --force-overwrite=true \
+  -o experiments/target_placement/nsight_edge_vllm_tp8 \
+  python -m vllm.entrypoints.openai.api_server \
+    --model /home/chajiahao/data/hf_models/Qwen3-32B \
+    --served-model-name /home/chajiahao/data/hf_models/Qwen3-32B \
+    --tensor-parallel-size 8 \
+    --dtype bfloat16 \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+然后在另一个终端只跑小范围 client benchmark，例如加 `--concurrency-level 1` 的关键 placement。不要对所有组合都跑 Nsight，否则实验成本会膨胀。
+
 ## 第一阶段质量 sanity check
 
 第一轮只做 greedy 输出一致性检查，不做大规模 benchmark。正式运行 benchmark 时加 `--save-text`，然后比较同一组 `prompt_id / run_index / concurrent_worker` 下 A100 和 3090x8 的输出。
