@@ -411,6 +411,22 @@ This writes `gpu_metrics.csv`, `gpu_metrics_summary.csv`, and the raw
 one or two most important serving runs when NCCL or inter-GPU communication
 needs deeper diagnosis.
 
+Generate the agreed first-round runbook scripts:
+
+```bash
+python target_placement_run_matrix.py \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-root experiments/target_placement/qwen32b_bf16 \
+  --runbook-dir experiments/target_placement/qwen32b_bf16_runbook
+```
+
+The generated runbook contains:
+
+- `01_client_visible_all.sh`: all placements, networks, and `1/2/4/8` concurrency levels.
+- `02_gpu_sampling_representative.sh`: A100-vLLM, edge-vLLM-TP8, edge-vLLM-TP4PP2, and edge-SGLang-TP8.
+- `03_nsight_server_key_methods.sh`: Nsight server profiles for edge-vLLM-TP8 and edge-vLLM-TP4PP2.
+- `04_nsight_client_key_methods.sh`: matching client commands for the Nsight runs.
+
 Run the first-stage greedy output sanity check on the saved text:
 
 ```bash

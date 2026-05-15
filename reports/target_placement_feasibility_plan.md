@@ -186,6 +186,35 @@ nsys profile \
 
 然后在另一个终端只跑小范围 client benchmark，例如加 `--concurrency-level 1` 的关键 placement。不要对所有组合都跑 Nsight，否则实验成本会膨胀。
 
+## 第一轮最终运行范围
+
+本轮只按下面的范围跑，避免实验扩散：
+
+| 覆盖层 | 跑哪些组合 | 目的 |
+|---|---|---|
+| client-visible 全量 | `configs/target_placement_qwen32b_bf16.local.json` 里的所有 placement、network、`1/2/4/8` 并发 | 形成主结果表，比较 A100 与 3090x8 多种部署方法的端到端延迟 |
+| GPU 轻量采样 | A100-vLLM、edge-vLLM-TP8、edge-vLLM-TP4PP2、edge-SGLang-TP8 | 记录 GPU utilization、显存、功耗、温度，定位资源瓶颈 |
+| Nsight Systems | edge-vLLM-TP8、edge-vLLM-TP4PP2 | 只对关键 vLLM 端边方法抓 CUDA/NCCL/通信，比较 TP8 与 TP4PP2 的通信瓶颈 |
+
+生成本轮 runbook：
+
+```bash
+python target_placement_run_matrix.py \
+  --plan configs/target_placement_qwen32b_bf16.local.json \
+  --output-root experiments/target_placement/qwen32b_bf16 \
+  --runbook-dir experiments/target_placement/qwen32b_bf16_runbook
+```
+
+输出：
+
+| 文件 | 怎么用 |
+|---|---|
+| `01_client_visible_all.sh` | 先跑，生成完整 client-visible 主结果 |
+| `02_gpu_sampling_representative.sh` | 第二步跑，给四类部署方法补资源采样 |
+| `03_nsight_server_key_methods.sh` | 在服务端逐条执行，每次只 profile 一个 serving 方法 |
+| `04_nsight_client_key_methods.sh` | 与 Nsight server 对应，在另一个终端触发 client 请求 |
+| `first_round_matrix.csv` | 本轮全量 client-visible 矩阵索引 |
+
 ## 第一阶段质量 sanity check
 
 第一轮只做 greedy 输出一致性检查，不做大规模 benchmark。正式运行 benchmark 时加 `--save-text`，然后比较同一组 `prompt_id / run_index / concurrent_worker` 下 A100 和 3090x8 的输出。
